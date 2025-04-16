@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FastAPI + Vosk 实时语音转文字 (中文)</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #controls button { padding: 10px 15px; font-size: 16px; cursor: pointer; margin-right: 10px; }
+        #status { margin-top: 15px; font-style: italic; color: #555; }
+        #transcript { margin-top: 20px; padding: 15px; border: 1px solid #ccc; min-height: 100px; background-color: #f9f9f9; white-space: pre-wrap; /* 保留换行和空格 */ }
+        .partial { color: #888; } /* 部分结果用灰色显示 */
+    </style>
+</head>
+<body>
+
+<h1>实时语音转文字 (中文)</h1>
+
+<div id="controls">
+    <button id="startButton">开始识别</button>
+    <button id="stopButton" disabled>停止识别</button>
+</div>
+
+<div id="status">状态：未连接</div>
+<div id="transcript">
+    <p>识别结果将显示在这里...</p>
+</div>
+
+<script>
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const statusDiv = document.getElementById('status');
+    const transcriptDiv = document.getElementById('transcript');
+
+    let websocket;
+    let audioContext;
+    let scriptProcessor;
+    let mediaStream;
+    let isRecording = false;
+    let partialTranscriptElement = null; // 用于跟踪当前的部分结果元素
+
+    // --- WebSocket 地址 ---
+    // 使用 `ws://` 或 `wss://` (如果你的 FastAPI 服务器配置了 HTTPS)
+    // 确保主机和端口与你的 FastAPI 服务器匹配
+    const wsUrl = `ws://${window.location.host}/ws`; // 通常是 ws://127.0.0.1:8000/ws 或 ws://localhost:8000/ws
+
+    // --- 音频参数 ---
+    const TARGET_SAMPLE_RATE = 16000; // 必须与后端 Vosk 识别器期望的采样率一致
+    const BUFFER_SIZE = 4096;       // 处理音频的缓冲区大小
+
+    // --- 开始识别 ---
+    startButton.onclick = async () => {
+        if (isRecording) return;
+        statusDiv.textContent = '状态：正在请求麦克风权限...';
+        transcriptDiv.innerHTML = '<p>识别结果将显示在这里...</p>'; // 清空之前的记录
+        partialTranscriptElement = null;
+
+        try {
+            // 1. 获取麦克风权限和音频流
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    // 尝试请求目标采样率，但浏览器不一定会满足
+                    // sampleRate: TARGET_SAMPLE_RATE, // 有些浏览器不支持此约束
+                    echoCancellation: true, // 开启回声消除
+                    noiseSuppression: true, // 开启噪声抑制
+                },
+                video: false
+            });
+
+            statusDiv.textContent = '状态：已获取麦克风权限，正在连接服务器...';
+
+            // 2. 创建 WebSocket 连接
+            websocket = new WebSocket(wsUrl);
+
+            websocket.onopen = () => {
+                statusDiv.textContent = '状态：连接成功，正在识别...';
+                isRecording = true;
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                startAudioProcessing(); // 连接成功后开始处理音频
+            };
+
+            websocket.onmessage = (event) => {
+                // console.log("收到消息:", event.data); // 调试用
+                try {
+                    const result = JSON.parse(event.data);
+
+                    if (result.error) {
+                        console.error("服务器错误:", result.error);
+                        statusDiv.textContent = `状态：错误 - ${result.error}`;
+                        stopRecording(); // 发生错误时停止
+                        return;
+                    }
+
+                    updateTranscript(result);
+
+                } catch (e) {
+                    console.error("解析服务器消息失败:", e);
+                    // 可能是非 JSON 消息或其他问题
+                }
+            };
+
+            websocket.onerror = (event) => {
+                console.error("WebSocket 错误:", event);
+                statusDiv.textContent = '状态：WebSocket 连接错误';
+                isRecording = false; // 确保状态被重置
+                cleanupAudio();
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            };
+
+            websocket.onclose = (event) => {
+                console.log("WebSocket 连接关闭:", event.code, event.reason);
+                // 只有在不是用户主动停止的情况下才更新状态为“已断开”
+                if (isRecording) {
+                    statusDiv.textContent = '状态：连接已断开';
+                }
+                isRecording = false;
+                cleanupAudio();
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                partialTranscriptElement = null; // 清理部分结果元素引用
+            };
+
+        } catch (err) {
+            console.error('获取麦克风或连接 WebSocket 失败:', err);
+            statusDiv.textContent = `状态：错误 - ${err.message}`;
+            cleanupAudio(); // 确保资源被清理
+            isRecording = false;
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        }
+    };
+
+    // --- 停止识别 ---
+    stopButton.onclick = () => {
+        stopRecording();
+    };
+
+    // --- 停止录音和连接的函数 ---
+    function stopRecording() {
+        if (!isRecording) return;
+        isRecording = false; // 先设置状态，防止 onclose 事件重复设置状态
+        statusDiv.textContent = '状态：已停止';
+        startButton.disabled = false;
+        stopButton.disabled = true;
+
+        // 关闭 WebSocket
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            websocket.close();
+        }
+        websocket = null; // 清除引用
+
+        // 清理音频资源
+        cleanupAudio();
+    }
+
+    // --- 开始处理音频 ---
+    function startAudioProcessing() {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        // 检查实际采样率，如果需要，进行重采样
+        const sourceSampleRate = audioContext.sampleRate;
+        console.log(`音频上下文采样率: ${sourceSampleRate} Hz`);
+
+        const source = audioContext.createMediaStreamSource(mediaStream);
+
+        // 创建 ScriptProcessorNode 用于处理音频块
+        // 注意: ScriptProcessorNode 已被废弃，推荐使用 AudioWorklet
+        // 但为了简单起见，这里先用 ScriptProcessorNode
+        scriptProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1); // bufferSize, inputChannels, outputChannels
+
+        scriptProcessor.onaudioprocess = (event) => {
+            if (!isRecording || !websocket || websocket.readyState !== WebSocket.OPEN) {
+                return; // 如果不在录音或 WebSocket 未连接，则不处理
+            }
+
+            const inputData = event.inputBuffer.getChannelData(0); // 获取单声道数据 (Float32Array)
+
+            // **重采样 (如果需要)** 和 **转换为 16位 PCM**
+            const pcm16Buffer = convertFloat32ToInt16(inputData, sourceSampleRate, TARGET_SAMPLE_RATE);
+
+            // 发送处理后的音频数据到 WebSocket 服务器
+            websocket.send(pcm16Buffer);
+        };
+
+        // 连接节点: source -> scriptProcessor -> destination (destination 通常是扬声器，但我们不需要播放)
+        // 如果不连接到 destination，在某些浏览器中 onaudioprocess 可能不会触发
+        source.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination); // 连接到 destination 以确保处理进行
+    }
+
+    // --- 清理音频资源 ---
+    function cleanupAudio() {
+        if (scriptProcessor) {
+            scriptProcessor.disconnect(); // 断开节点连接
+            scriptProcessor.onaudioprocess = null; // 移除事件监听器
+            scriptProcessor = null;
+        }
+        if (audioContext) {
+            audioContext.close().catch(e => console.warn("关闭 AudioContext 时出错:", e)); // 关闭音频上下文
+            audioContext = null;
+        }
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop()); // 停止麦克风轨道
+            mediaStream = null;
+        }
+        console.log("音频资源已清理");
+    }
+
+    // --- 更新转录文本显示 ---
+    function updateTranscript(result) {
+        // 如果是第一次收到消息，清除默认提示
+        if (transcriptDiv.firstElementChild && transcriptDiv.firstElementChild.textContent === '识别结果将显示在这里...') {
+            transcriptDiv.innerHTML = '';
+        }
+
+        if (result.partial) {
+            // 处理部分结果
+            const partialText = result.partial.trim();
+            if (!partialTranscriptElement) {
+                // 如果还没有部分结果元素，创建一个
+                partialTranscriptElement = document.createElement('span');
+                partialTranscriptElement.className = 'partial';
+                transcriptDiv.appendChild(partialTranscriptElement);
+            }
+            // 更新部分结果内容
+            partialTranscriptElement.textContent = partialText + '... '; // 加省略号表示未确定
+            // 滚动到底部
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        } else if (result.text && result.text.trim()) {
+            // 处理最终结果
+            const finalText = result.text.trim();
+            // 移除旧的部分结果元素（如果存在）
+            if (partialTranscriptElement) {
+                partialTranscriptElement.remove();
+                partialTranscriptElement = null;
+            }
+            // 添加最终结果 (作为普通文本节点，后面可以加换行)
+            const finalSpan = document.createElement('span');
+            finalSpan.textContent = finalText + '。 '; // 加上句号和空格
+            transcriptDiv.appendChild(finalSpan);
+            // transcriptDiv.appendChild(document.createElement('br')); // 如果希望每个最终结果换行
+            // 滚动到底部
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        }
+        // 可以添加对 result.result (包含词语时间戳等详细信息) 的处理
+    }
+
+
+    // --- 音频格式转换和重采样函数 ---
+    // 将 Float32Array [-1.0, 1.0] 转换为 Int16Array [-32767, 32767]
+    // 并执行简单的线性插值重采样
+    function convertFloat32ToInt16(buffer, sourceSr, targetSr) {
+        if (sourceSr === targetSr) {
+            // 无需重采样
+            const l = buffer.length;
+            const buf = new Int16Array(l);
+            while (l--) {
+                buf[l] = Math.min(1, buffer[l]); // Clamp to [-1, 1] (shouldn't be needed but safety first)
+                buf[l] = Math.max(-1, buf[l]);
+                buf[l] = buf[l] < 0 ? buf[l] * 0x8000 : buf[l] * 0x7FFF; // Convert to 16-bit int
+            }
+            return buf.buffer; // 返回 ArrayBuffer
+        }
+
+        // 需要重采样
+        const ratio = sourceSr / targetSr;
+        const newLength = Math.round(buffer.length / ratio);
+        const result = new Int16Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+
+        while (offsetResult < newLength) {
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+            let accum = 0, count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                accum += buffer[i];
+                count++;
+            }
+            // 简单的平均值作为插值（可以改进为更复杂的插值算法）
+            const sampleValue = count > 0 ? accum / count : 0;
+            // Clamp and convert to Int16
+            let intSample = Math.min(1, sampleValue);
+            intSample = Math.max(-1, intSample);
+            result[offsetResult] = intSample < 0 ? intSample * 0x8000 : intSample * 0x7FFF;
+
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+        }
+        return result.buffer; // 返回 ArrayBuffer
+    }
+
+</script>
+
+</body>
+</html>
