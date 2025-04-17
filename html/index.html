@@ -14,6 +14,7 @@
             min-height: 95vh;
             margin: 0;
             background-color: #f4f4f4; 
+            overflow: hidden;
         }
 
         h1 {
@@ -29,6 +30,8 @@
             width: 100%;
             max-width: 1400px;
             margin: 0 auto;
+            overflow: hidden;
+            height: 70vh; 
         }
 
         #digitalHumanArea {
@@ -45,6 +48,7 @@
             background-color: #b8b7b7;
             padding: 15px;
             box-sizing: border-box;
+            overflow: hidden;
         }
 
         #speechInteractionWrapper {
@@ -54,6 +58,8 @@
             flex-direction: column;
             gap: 20px;
             min-width: 300px;
+            overflow: hidden;
+            height: 100%;
         }
 
         #speechRecognitionArea, #controls-file {
@@ -66,14 +72,38 @@
             box-sizing: border-box;
             display: flex;
             flex-direction: column;
+            /*height: 100%;*/
+            flex-grow: 1;
+            min-height: 0;
             height: 100%;
         }
+
+        #transcript {
+            margin-top: 10px;
+            padding: 15px;
+            border: 1px solid #ccc;
+            min-height: 100px;
+            height: calc(100% - 150px);
+            overflow-y: auto;
+            scrollbar-width: thin;
+            background-color: #f9f9f9;
+            white-space: pre-wrap;
+            border-radius: 4px;
+            line-height: 1.6;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            height: auto; 
+        }
+
 
         #controls {
             display: flex;
             align-items: center;
             gap: 10px;
             margin-bottom: 15px;
+            flex-shrink: 0;
         }
 
         #controls button {
@@ -92,9 +122,11 @@
             display: flex;
             gap: 8px;
             margin-bottom: 10px;
+            flex-shrink: 0;
         }
 
-        .upload-actions input[type="file"],
+        .upload-actions input[type="file"],        
+
         .upload-actions button {
             max-width: 100%;
             box-sizing: border-box;
@@ -105,28 +137,12 @@
             font-size: 0.9em;
             color: #555;
             word-break: break-all;
+            flex-shrink: 0;
         }
 
         #file-info {
             margin-right: 10px;
             display: inline-block;
-        }
-
-        #transcript {
-            margin-top: 10px;
-            padding: 15px;
-            border: 1px solid #ccc;
-            min-height: 100px;
-            height: calc(100% - 150px);
-            overflow-y: auto;
-            background-color: #f9f9f9;
-            white-space: pre-wrap;
-            border-radius: 4px;
-            line-height: 1.6;
-            flex-grow: 1;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
         }
 
         #transcript p:first-child {
@@ -239,6 +255,7 @@
             <div id="controls">
                 <button id="startButton">开始识别</button>
                 <button id="stopButton" disabled>停止识别</button>
+                <button id="cleanButton" >清除内容</button>
                 <span id="status-mic">状态：未连接</span>
             </div>
 
@@ -265,6 +282,7 @@
     // 并且布局的改变不影响其功能逻辑。
     const startButton = document.getElementById('startButton');
     const stopButton = document.getElementById('stopButton');
+    const cleanButton = document.getElementById('cleanButton');
     const statusDiv = document.getElementById('status-mic');
     const audioFileInput = document.getElementById('audioFileInput');
     const uploadButton = document.getElementById('uploadButton');
@@ -339,7 +357,7 @@
         if (isRecording) return;
         statusDiv.textContent = '状态：正在请求麦克风权限...';
         // 清空转录区域，保留初始提示结构
-        transcriptDiv.innerHTML = '<p>识别结果将显示在这里...</p>';
+        //transcriptDiv.innerHTML = '<p>识别结果将显示在这里...</p>';
         partialTranscriptElement = null;
 
         try {
@@ -413,6 +431,11 @@
     stopButton.onclick = () => {
         stopRecording();
     };
+
+    cleanButton.onclick = () => {
+        transcriptDiv.innerHTML = '';
+        currentPartialMessageElement = null;
+    }
 
     audioFileInput.onchange = () => {
         const file = audioFileInput.files[0];
