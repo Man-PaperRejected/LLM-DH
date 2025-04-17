@@ -1,75 +1,238 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+</div>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FastAPI + Vosk 实时语音转文字 (中文)</title>
+    <title>FastAPI + Vosk 实时语音转文字</title>
     <style>
-        body { font-family: sans-serif; padding: 20px; }
-        #controls button { padding: 10px 15px; font-size: 16px; cursor: pointer; margin-right: 10px; }
-        #status { margin-top: 15px; font-style: italic; color: #555; }
-        #transcript { margin-top: 20px; padding: 15px; border: 1px solid #ccc; min-height: 100px; background-color: #f9f9f9; white-space: pre-wrap; /* 保留换行和空格 */ }
-        .partial { color: #888; } /* 部分结果用灰色显示 */
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            min-height: 95vh;
+            margin: 0;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            flex-shrink: 0;
+        }
+
+        .main-container {
+            display: flex;
+            flex-grow: 1;
+            gap: 20px;
+            width: 100%;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        #digitalHumanArea {
+            flex-basis: 65%;
+            flex-shrink: 0;
+            border: 2px dashed #ccc;
+            min-height: 400px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #aaa;
+            font-size: 1.2em;
+            text-align: center;
+            background-color: #f8f8f8;
+            padding: 15px;
+            box-sizing: border-box;
+        }
+
+        #speechInteractionWrapper {
+            flex-basis: 35%;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            min-width: 300px;
+        }
+
+        #speechRecognitionArea, #controls-file {
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: #fff;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            width: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        #controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        #controls button {
+            padding: 10px 15px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #status-mic {
+            margin-left: auto;
+            font-style: italic;
+            color: #555;
+        }
+
+        .upload-actions {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .upload-actions input[type="file"],
+        .upload-actions button {
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+
+        .upload-status {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #555;
+            word-break: break-all;
+        }
+
+        #file-info {
+            margin-right: 10px;
+            display: inline-block;
+        }
+
+        #transcript {
+            margin-top: 10px;
+            padding: 15px;
+            border: 1px solid #ccc;
+            min-height: 100px;
+            height: calc(100% - 150px);
+            overflow-y: auto;
+            background-color: #f9f9f9;
+            white-space: pre-wrap;
+            border-radius: 4px;
+            line-height: 1.6;
+            flex-grow: 1;
+        }
+
+        #transcript p:first-child {
+            color: #888;
+            font-style: italic;
+            text-align: center;
+        }
+
+        .partial {
+            color: #888;
+            opacity: 0.8;
+        }
+
+        .section-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            display: block;
+        }
+
+        .status {
+            font-style: italic;
+            color: #555;
+        }
     </style>
 </head>
 <body>
 
-<h1>实时语音转文字 (中文)</h1>
+<h1>实时语音转文字与数字人交互</h1>
 
-<div id="controls">
-    <button id="startButton">开始识别</button>
-    <button id="stopButton" disabled>停止识别</button>
+<div class="main-container">
+    <!-- 左侧：数字人区域 -->
+    <div id="digitalHumanArea">
+        这里是预留的数字人显示区域 (65%)
+        <!-- <img src="your-image.jpg" alt="数字人" style="max-width: 100%; max-height: 100%;"> -->
+    </div>
+
+    <!-- 右侧：语音交互区域 -->
+    <div id="speechInteractionWrapper">
+        <!-- 麦克风识别 -->
+        <div id="speechRecognitionArea">
+            <div id="controls">
+                <button id="startButton">开始识别</button>
+                <button id="stopButton" disabled>停止识别</button>
+                <span id="status-mic">状态：未连接</span>
+            </div>
+
+            <div class="upload-actions">
+                <input type="file" id="audioFileInput" accept="audio/*">
+                <button id="uploadButton">上传并识别</button>
+            </div>
+            
+            <div class="upload-status">
+                <span id="file-info"></span>
+                <span id="status-file" class="status"></span>
+            </div>
+           
+            <div id="transcript">
+                <p>识别结果将显示在这里...</p>
+            </div>
+        </div>
+    </div>
 </div>
 
-<div id="status">状态：未连接</div>
-<div id="transcript">
-    <p>识别结果将显示在这里...</p>
-</div>
 
 <script>
+    // JavaScript 部分保持不变，因为它通过 ID 选择元素，
+    // 并且布局的改变不影响其功能逻辑。
     const startButton = document.getElementById('startButton');
     const stopButton = document.getElementById('stopButton');
-    const statusDiv = document.getElementById('status');
+    const statusDiv = document.getElementById('status-mic');
+    const audioFileInput = document.getElementById('audioFileInput');
+    const uploadButton = document.getElementById('uploadButton');
+    const statusFile = document.getElementById('status-file');
+    const fileInfo = document.getElementById('file-info');
+
     const transcriptDiv = document.getElementById('transcript');
 
     let websocket;
     let audioContext;
-    let scriptProcessor;
+    let scriptProcessor; // 或者 AudioWorkletNode
     let mediaStream;
     let isRecording = false;
     let partialTranscriptElement = null; // 用于跟踪当前的部分结果元素
 
     // --- WebSocket 地址 ---
-    // 使用 `ws://` 或 `wss://` (如果你的 FastAPI 服务器配置了 HTTPS)
-    // 确保主机和端口与你的 FastAPI 服务器匹配
-    const wsUrl = `ws://${window.location.host}/ws`; // 通常是 ws://127.0.0.1:8000/ws 或 ws://localhost:8000/ws
+    const wsUrl = `ws://${window.location.host}/ws`;
 
     // --- 音频参数 ---
-    const TARGET_SAMPLE_RATE = 16000; // 必须与后端 Vosk 识别器期望的采样率一致
-    const BUFFER_SIZE = 4096;       // 处理音频的缓冲区大小
+    const TARGET_SAMPLE_RATE = 16000;
+    const BUFFER_SIZE = 4096;
 
     // --- 开始识别 ---
     startButton.onclick = async () => {
         if (isRecording) return;
         statusDiv.textContent = '状态：正在请求麦克风权限...';
-        transcriptDiv.innerHTML = '<p>识别结果将显示在这里...</p>'; // 清空之前的记录
+        // 清空转录区域，保留初始提示结构
+        transcriptDiv.innerHTML = '<p>识别结果将显示在这里...</p>';
         partialTranscriptElement = null;
 
         try {
-            // 1. 获取麦克风权限和音频流
             mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    // 尝试请求目标采样率，但浏览器不一定会满足
-                    // sampleRate: TARGET_SAMPLE_RATE, // 有些浏览器不支持此约束
-                    echoCancellation: true, // 开启回声消除
-                    noiseSuppression: true, // 开启噪声抑制
+                    echoCancellation: true,
+                    noiseSuppression: true,
                 },
                 video: false
             });
 
             statusDiv.textContent = '状态：已获取麦克风权限，正在连接服务器...';
 
-            // 2. 创建 WebSocket 连接
             websocket = new WebSocket(wsUrl);
 
             websocket.onopen = () => {
@@ -77,33 +240,28 @@
                 isRecording = true;
                 startButton.disabled = true;
                 stopButton.disabled = false;
-                startAudioProcessing(); // 连接成功后开始处理音频
+                startAudioProcessing(); // 开始处理音频
             };
 
             websocket.onmessage = (event) => {
-                // console.log("收到消息:", event.data); // 调试用
                 try {
                     const result = JSON.parse(event.data);
-
                     if (result.error) {
                         console.error("服务器错误:", result.error);
                         statusDiv.textContent = `状态：错误 - ${result.error}`;
-                        stopRecording(); // 发生错误时停止
+                        stopRecording();
                         return;
                     }
-
                     updateTranscript(result);
-
                 } catch (e) {
                     console.error("解析服务器消息失败:", e);
-                    // 可能是非 JSON 消息或其他问题
                 }
             };
 
             websocket.onerror = (event) => {
                 console.error("WebSocket 错误:", event);
                 statusDiv.textContent = '状态：WebSocket 连接错误';
-                isRecording = false; // 确保状态被重置
+                isRecording = false;
                 cleanupAudio();
                 startButton.disabled = false;
                 stopButton.disabled = true;
@@ -111,21 +269,20 @@
 
             websocket.onclose = (event) => {
                 console.log("WebSocket 连接关闭:", event.code, event.reason);
-                // 只有在不是用户主动停止的情况下才更新状态为“已断开”
-                if (isRecording) {
+                if (isRecording) { // 避免在手动停止时显示“已断开”
                     statusDiv.textContent = '状态：连接已断开';
                 }
                 isRecording = false;
                 cleanupAudio();
                 startButton.disabled = false;
                 stopButton.disabled = true;
-                partialTranscriptElement = null; // 清理部分结果元素引用
+                partialTranscriptElement = null;
             };
 
         } catch (err) {
             console.error('获取麦克风或连接 WebSocket 失败:', err);
             statusDiv.textContent = `状态：错误 - ${err.message}`;
-            cleanupAudio(); // 确保资源被清理
+            cleanupAudio();
             isRecording = false;
             startButton.disabled = false;
             stopButton.disabled = true;
@@ -137,158 +294,228 @@
         stopRecording();
     };
 
+    audioFileInput.onchange = () => {
+        const file = audioFileInput.files[0];
+        if (file) {
+            fileInfo.textContent = `已选择: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
+             statusFile.textContent = ''; // Clear previous status/error
+             statusFile.classList.remove('error');
+        } else {
+            fileInfo.textContent = '';
+        }
+    };
+
+    uploadButton.onclick = async () => {
+        const file = audioFileInput.files[0];
+        if (!file) {
+            alert('请先选择一个音频文件！');
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('audio_file', file);
+
+        // Disable buttons during upload
+        uploadButton.disabled = true;
+        audioFileInput.disabled = true;
+        statusFile.textContent = '状态: 正在上传和处理...';
+        statusFile.classList.remove('error');
+        // Clear previous output OR indicate new process starting
+        transcriptDiv.textContent = '正在处理上传的文件...'; // Indicate processing
+
+        try {
+            const response = await fetch('/upload_audio/', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                let errorMsg = `HTTP 错误: ${response.status}`;
+                try { // Try to get detailed error from server response body
+                    const errData = await response.json();
+                    errorMsg += ` - ${errData.detail || '未知错误'}`;
+                } catch (e) { /* Ignore if response body is not JSON */ }
+                throw new Error(errorMsg);
+            }
+
+            const data = await response.json();
+
+            // ** 更新统一的输出区域 **
+            // Replace the content with the file's transcription result
+            transcriptDiv.textContent = `文件 (${file.name}) 识别结果:\n--------------------------\n${data.transcription}`;
+            statusFile.textContent = '状态: 处理完成！';
+            console.log('File transcription:', data.transcription);
+
+        } catch (error) {
+            console.error('Error uploading or processing file:', error);
+            statusFile.textContent = `错误: ${error.message}`;
+             statusFile.classList.add('error');
+             // Show error in the main output area as well
+             transcriptDiv.textContent = `文件处理出错: ${error.message}`;
+        } finally {
+            // Re-enable buttons
+            uploadButton.disabled = false;
+            audioFileInput.disabled = false;
+            // Optionally clear file input for next upload?
+            // audioFileInput.value = null;
+            // fileInfo.textContent = '';
+        }
+    };
+
     // --- 停止录音和连接的函数 ---
     function stopRecording() {
         if (!isRecording) return;
-        isRecording = false; // 先设置状态，防止 onclose 事件重复设置状态
+        isRecording = false;
         statusDiv.textContent = '状态：已停止';
         startButton.disabled = false;
         stopButton.disabled = true;
 
-        // 关闭 WebSocket
         if (websocket && websocket.readyState === WebSocket.OPEN) {
+            // 可以在关闭前发送一个特殊的“结束”信号（如果后端需要）
+            // websocket.send(JSON.stringify({ command: "stop" }));
             websocket.close();
         }
-        websocket = null; // 清除引用
+        websocket = null;
 
-        // 清理音频资源
         cleanupAudio();
     }
 
-    // --- 开始处理音频 ---
+    // --- 开始处理音频 (仍使用 ScriptProcessorNode) ---
     function startAudioProcessing() {
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-        // 检查实际采样率，如果需要，进行重采样
         const sourceSampleRate = audioContext.sampleRate;
         console.log(`音频上下文采样率: ${sourceSampleRate} Hz`);
 
+        // 建议在实际使用中切换到 AudioWorklet
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+             console.error("浏览器不支持 getUserMedia");
+             statusDiv.textContent = '状态：错误 - 浏览器不支持麦克风输入';
+             stopRecording();
+             return;
+        }
+
         const source = audioContext.createMediaStreamSource(mediaStream);
 
-        // 创建 ScriptProcessorNode 用于处理音频块
-        // 注意: ScriptProcessorNode 已被废弃，推荐使用 AudioWorklet
-        // 但为了简单起见，这里先用 ScriptProcessorNode
-        scriptProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1); // bufferSize, inputChannels, outputChannels
+        // 注意: ScriptProcessorNode 已被废弃
+        scriptProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
         scriptProcessor.onaudioprocess = (event) => {
             if (!isRecording || !websocket || websocket.readyState !== WebSocket.OPEN) {
-                return; // 如果不在录音或 WebSocket 未连接，则不处理
+                return;
             }
 
-            const inputData = event.inputBuffer.getChannelData(0); // 获取单声道数据 (Float32Array)
-
-            // **重采样 (如果需要)** 和 **转换为 16位 PCM**
+            const inputData = event.inputBuffer.getChannelData(0);
             const pcm16Buffer = convertFloat32ToInt16(inputData, sourceSampleRate, TARGET_SAMPLE_RATE);
-
-            // 发送处理后的音频数据到 WebSocket 服务器
             websocket.send(pcm16Buffer);
         };
 
-        // 连接节点: source -> scriptProcessor -> destination (destination 通常是扬声器，但我们不需要播放)
-        // 如果不连接到 destination，在某些浏览器中 onaudioprocess 可能不会触发
         source.connect(scriptProcessor);
-        scriptProcessor.connect(audioContext.destination); // 连接到 destination 以确保处理进行
+        scriptProcessor.connect(audioContext.destination); // 必需，否则可能不触发 process
     }
 
     // --- 清理音频资源 ---
     function cleanupAudio() {
         if (scriptProcessor) {
-            scriptProcessor.disconnect(); // 断开节点连接
-            scriptProcessor.onaudioprocess = null; // 移除事件监听器
+            scriptProcessor.disconnect();
+            scriptProcessor.onaudioprocess = null;
             scriptProcessor = null;
         }
-        if (audioContext) {
-            audioContext.close().catch(e => console.warn("关闭 AudioContext 时出错:", e)); // 关闭音频上下文
-            audioContext = null;
+        // 检查 audioContext 状态，避免在已关闭时再次关闭
+        if (audioContext && audioContext.state !== 'closed') {
+            audioContext.close().catch(e => console.warn("关闭 AudioContext 时出错:", e));
         }
+        audioContext = null; // 清除引用
         if (mediaStream) {
-            mediaStream.getTracks().forEach(track => track.stop()); // 停止麦克风轨道
+            mediaStream.getTracks().forEach(track => track.stop());
             mediaStream = null;
         }
         console.log("音频资源已清理");
     }
 
-    // --- 更新转录文本显示 ---
+   // --- 更新转录文本显示 ---
     function updateTranscript(result) {
-        // 如果是第一次收到消息，清除默认提示
-        if (transcriptDiv.firstElementChild && transcriptDiv.firstElementChild.textContent === '识别结果将显示在这里...') {
-            transcriptDiv.innerHTML = '';
+        // 查找初始的 <p> 元素
+        const initialPrompt = transcriptDiv.querySelector('p');
+        // 如果初始提示信息仍然存在，则移除它
+        if (initialPrompt && initialPrompt.textContent === '识别结果将显示在这里...') {
+            transcriptDiv.innerHTML = ''; // 清空内容，准备接收真实转录
         }
 
+
         if (result.partial) {
-            // 处理部分结果
             const partialText = result.partial.trim();
+             // 如果部分结果为空（可能在静音段后），不做任何操作或移除部分元素
+            if (!partialText) {
+                if (partialTranscriptElement) {
+                    partialTranscriptElement.remove();
+                    partialTranscriptElement = null;
+                }
+                return; // 没有部分文本，直接返回
+            }
+
             if (!partialTranscriptElement) {
-                // 如果还没有部分结果元素，创建一个
                 partialTranscriptElement = document.createElement('span');
                 partialTranscriptElement.className = 'partial';
+                // 将部分结果添加到最后，如果前面有最终结果，则在其后添加
                 transcriptDiv.appendChild(partialTranscriptElement);
+                 // 添加一个空格，使其与之前的最终结果分开
+                if(transcriptDiv.childElementCount > 1) { // 检查是否是第一个元素
+                     partialTranscriptElement.insertAdjacentText('beforebegin', ' ');
+                }
             }
-            // 更新部分结果内容
-            partialTranscriptElement.textContent = partialText + '... '; // 加省略号表示未确定
-            // 滚动到底部
-            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+            partialTranscriptElement.textContent = partialText + '...'; // 显示部分结果
+
         } else if (result.text && result.text.trim()) {
-            // 处理最终结果
             const finalText = result.text.trim();
-            // 移除旧的部分结果元素（如果存在）
+            let finalSpan;
+
             if (partialTranscriptElement) {
-                partialTranscriptElement.remove();
-                partialTranscriptElement = null;
+                // 如果存在部分结果，用最终结果替换它
+                finalSpan = document.createElement('span');
+                finalSpan.textContent = finalText + '。'; // 加上句号
+                partialTranscriptElement.replaceWith(finalSpan); // 替换节点
+                partialTranscriptElement = null; // 清除引用
+            } else {
+                // 如果没有部分结果，直接添加最终结果
+                finalSpan = document.createElement('span');
+                finalSpan.textContent = finalText + '。'; // 加上句号
+                // 在添加前检查最后一个元素是否是 span，如果是，则在其后加一个空格再添加新的
+                if(transcriptDiv.lastElementChild && transcriptDiv.lastElementChild.tagName === 'SPAN') {
+                    transcriptDiv.appendChild(document.createTextNode(' ')); // 添加空格文本节点
+                }
+                transcriptDiv.appendChild(finalSpan);
             }
-            // 添加最终结果 (作为普通文本节点，后面可以加换行)
-            const finalSpan = document.createElement('span');
-            finalSpan.textContent = finalText + '。 '; // 加上句号和空格
-            transcriptDiv.appendChild(finalSpan);
-            // transcriptDiv.appendChild(document.createElement('br')); // 如果希望每个最终结果换行
-            // 滚动到底部
-            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
         }
-        // 可以添加对 result.result (包含词语时间戳等详细信息) 的处理
+         // 始终滚动到底部以显示最新内容
+        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
     }
 
 
     // --- 音频格式转换和重采样函数 ---
-    // 将 Float32Array [-1.0, 1.0] 转换为 Int16Array [-32767, 32767]
-    // 并执行简单的线性插值重采样
     function convertFloat32ToInt16(buffer, sourceSr, targetSr) {
-        if (sourceSr === targetSr) {
-            // 无需重采样
-            const l = buffer.length;
-            const buf = new Int16Array(l);
-            while (l--) {
-                buf[l] = Math.min(1, buffer[l]); // Clamp to [-1, 1] (shouldn't be needed but safety first)
-                buf[l] = Math.max(-1, buf[l]);
-                buf[l] = buf[l] < 0 ? buf[l] * 0x8000 : buf[l] * 0x7FFF; // Convert to 16-bit int
-            }
-            return buf.buffer; // 返回 ArrayBuffer
-        }
-
-        // 需要重采样
-        const ratio = sourceSr / targetSr;
-        const newLength = Math.round(buffer.length / ratio);
-        const result = new Int16Array(newLength);
+        let outputBuffer;
+        let sampleRatio = sourceSr / targetSr;
+        let newLength = Math.round(buffer.length / sampleRatio);
+        outputBuffer = new Int16Array(newLength);
         let offsetResult = 0;
         let offsetBuffer = 0;
 
         while (offsetResult < newLength) {
-            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+            let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRatio);
             let accum = 0, count = 0;
             for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
                 accum += buffer[i];
                 count++;
             }
-            // 简单的平均值作为插值（可以改进为更复杂的插值算法）
-            const sampleValue = count > 0 ? accum / count : 0;
-            // Clamp and convert to Int16
-            let intSample = Math.min(1, sampleValue);
-            intSample = Math.max(-1, intSample);
-            result[offsetResult] = intSample < 0 ? intSample * 0x8000 : intSample * 0x7FFF;
-
+            // Clamp and convert value
+            let value = Math.max(-1, Math.min(1, count > 0 ? accum / count : 0));
+             // Convert to 16-bit PCM
+            outputBuffer[offsetResult] = value < 0 ? value * 0x8000 : value * 0x7FFF;
             offsetResult++;
             offsetBuffer = nextOffsetBuffer;
         }
-        return result.buffer; // 返回 ArrayBuffer
+        return outputBuffer.buffer; // 返回 ArrayBuffer
     }
 
 </script>
