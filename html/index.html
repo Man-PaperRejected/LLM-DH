@@ -13,6 +13,7 @@
             flex-direction: column;
             min-height: 95vh;
             margin: 0;
+            background-color: #f4f4f4; 
         }
 
         h1 {
@@ -41,7 +42,7 @@
             color: #aaa;
             font-size: 1.2em;
             text-align: center;
-            background-color: #f8f8f8;
+            background-color: #b8b7b7;
             padding: 15px;
             box-sizing: border-box;
         }
@@ -123,12 +124,84 @@
             border-radius: 4px;
             line-height: 1.6;
             flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
         }
 
         #transcript p:first-child {
             color: #888;
             font-style: italic;
             text-align: center;
+        }
+        
+        /* Initial Prompt Message */
+        #transcript p.initial-prompt {
+            color: #888;
+            font-style: italic;
+            text-align: center;
+            margin: auto; /* Center vertically and horizontally if alone */
+            padding: 20px;
+        }
+        /* General Message Bubble Style */
+        .message-bubble {
+            padding: 8px 12px;
+            border-radius: 15px;
+            max-width: 85%; /* Max width of a bubble */
+            word-wrap: break-word; /* Wrap long words */
+            line-height: 1.4;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }
+
+        /* Style for Finalized User Messages (Recognized Speech) */
+        .message-final {
+            background-color: #e1f5fe; /* Light blue background */
+            color: #333;
+            border: 1px solid #b3e5fc;
+            align-self: flex-start; /* Align to the left */
+            border-bottom-left-radius: 3px; /* Make it look like a speech bubble */
+        }
+
+        /* Style for Partial (In-progress) Messages */
+        .message-partial {
+            background-color: #f0f0f0; /* Lighter grey background */
+            color: #666;
+            font-style: italic;
+            border: 1px solid #e0e0e0;
+            align-self: flex-start; /* Align to the left */
+            border-bottom-left-radius: 3px;
+            opacity: 0.9;
+        }
+
+         /* Style for File Upload Results */
+        .message-file {
+            background-color: #e8f5e9; /* Light green background */
+            color: #1b5e20;
+            border: 1px solid #c8e6c9;
+            align-self: flex-start; /* Align to the left */
+            border-bottom-left-radius: 3px;
+            white-space: pre-wrap; /* Preserve line breaks from result */
+            font-family: monospace; /* Optional: Use monospace for file content */
+        }
+        .message-file strong { /* Style the filename part */
+             display: block;
+             margin-bottom: 5px;
+             font-family: sans-serif;
+             color: #333;
+             font-weight: bold;
+             font-size: 0.9em;
+        }
+
+        /* Style for Error Messages */
+        .message-error {
+            background-color: #ffebee; /* Light red background */
+            color: #c62828;
+            border: 1px solid #ffcdd2;
+            align-self: center; /* Center error messages */
+            text-align: center;
+            font-weight: bold;
+            width: 90%;
+            box-sizing: border-box;
         }
 
         .partial {
@@ -180,7 +253,7 @@
             </div>
            
             <div id="transcript">
-                <p>识别结果将显示在这里...</p>
+                <p class="initial-prompt">识别结果将显示在这里...</p>
             </div>
         </div>
     </div>
@@ -213,6 +286,53 @@
     // --- 音频参数 ---
     const TARGET_SAMPLE_RATE = 16000;
     const BUFFER_SIZE = 4096;
+
+    // --- Helper: Scroll transcript to bottom ---
+    function scrollTranscriptToEnd() {
+        setTimeout(() => {
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        }, 0);
+    }
+
+     // --- Helper: Add a message bubble to the transcript ---
+     function addMessageBubble(text, type = 'final', optionalFileName = null) {
+        // Remove initial prompt if it exists
+        const initialPrompt = transcriptDiv.querySelector('p.initial-prompt');
+        if (initialPrompt) {
+            initialPrompt.remove();
+        }
+
+        const messageDiv = document.createElement('div');
+        messageDiv.classList.add('message-bubble');
+
+        switch (type) {
+            case 'partial':
+                messageDiv.classList.add('message-partial');
+                messageDiv.textContent = text ? text + '...' : '...'; // Add ellipsis
+                currentPartialMessageElement = messageDiv; // Store reference
+                break;
+            case 'file':
+                 messageDiv.classList.add('message-file');
+                 const fileNameStrong = document.createElement('strong');
+                 fileNameStrong.textContent = `文件 (${optionalFileName || 'Unknown File'}):`;
+                 messageDiv.appendChild(fileNameStrong);
+                 messageDiv.appendChild(document.createTextNode(text)); // Add text node for transcription
+                 break;
+            case 'error':
+                messageDiv.classList.add('message-error');
+                messageDiv.textContent = text;
+                break;
+            case 'final':
+            default:
+                messageDiv.classList.add('message-final');
+                messageDiv.textContent = text + '。'; // Add punctuation
+                break;
+        }
+
+        transcriptDiv.appendChild(messageDiv);
+        scrollTranscriptToEnd(); // Scroll after adding
+        return messageDiv; // Return the created element if needed
+    }
 
     // --- 开始识别 ---
     startButton.onclick = async () => {
@@ -315,19 +435,26 @@
         const formData = new FormData();
         formData.append('audio_file', file);
 
+        const processingMessage = addMessageBubble(`正在处理文件: ${file.name}...`, 'status', true); 
+        scrollTranscriptToEnd();
+
         // Disable buttons during upload
         uploadButton.disabled = true;
         audioFileInput.disabled = true;
         statusFile.textContent = '状态: 正在上传和处理...';
         statusFile.classList.remove('error');
         // Clear previous output OR indicate new process starting
-        transcriptDiv.textContent = '正在处理上传的文件...'; // Indicate processing
+        <!-- transcriptDiv.textContent = '正在处理上传的文件...'; // Indicate processing -->
 
         try {
             const response = await fetch('/upload_audio/', {
                 method: 'POST',
                 body: formData
             });
+
+            if (processingMessage) {
+                processingMessage.remove();
+            }
 
             if (!response.ok) {
                 let errorMsg = `HTTP 错误: ${response.status}`;
@@ -340,9 +467,24 @@
 
             const data = await response.json();
 
+            if (data && data.transcription) {
+                // 不要覆盖 transcriptDiv.textContent 或 innerHTML
+                // transcriptDiv.textContent = result.text; // <--- 删除或注释掉这样的旧代码
+    
+                // 使用 addMessageBubble 添加结果到聊天框
+                addMessageBubble(data.transcription ,'final'); // 添加为最终消息
+    
+                // 添加滚动到底部的调用
+                scrollTranscriptToEnd();
+    
+            } else {
+                 addMessageBubble("从文件未识别到文本", "status");
+                 scrollTranscriptToEnd();
+            }
+
             // ** 更新统一的输出区域 **
             // Replace the content with the file's transcription result
-            transcriptDiv.textContent = `文件 (${file.name}) 识别结果:\n--------------------------\n${data.transcription}`;
+            //transcriptDiv.textContent = `文件 (${file.name}) 识别结果:\n--------------------------\n${data.transcription}`;
             statusFile.textContent = '状态: 处理完成！';
             console.log('File transcription:', data.transcription);
 
@@ -435,60 +577,49 @@
 
    // --- 更新转录文本显示 ---
     function updateTranscript(result) {
-        // 查找初始的 <p> 元素
-        const initialPrompt = transcriptDiv.querySelector('p');
-        // 如果初始提示信息仍然存在，则移除它
-        if (initialPrompt && initialPrompt.textContent === '识别结果将显示在这里...') {
-            transcriptDiv.innerHTML = ''; // 清空内容，准备接收真实转录
-        }
+        const partialText = result.partial ? result.partial.trim() : null;
+        const finalText = result.text ? result.text.trim() : null;
 
-
-        if (result.partial) {
-            const partialText = result.partial.trim();
-             // 如果部分结果为空（可能在静音段后），不做任何操作或移除部分元素
-            if (!partialText) {
-                if (partialTranscriptElement) {
-                    partialTranscriptElement.remove();
-                    partialTranscriptElement = null;
-                }
-                return; // 没有部分文本，直接返回
-            }
-
-            if (!partialTranscriptElement) {
-                partialTranscriptElement = document.createElement('span');
-                partialTranscriptElement.className = 'partial';
-                // 将部分结果添加到最后，如果前面有最终结果，则在其后添加
-                transcriptDiv.appendChild(partialTranscriptElement);
-                 // 添加一个空格，使其与之前的最终结果分开
-                if(transcriptDiv.childElementCount > 1) { // 检查是否是第一个元素
-                     partialTranscriptElement.insertAdjacentText('beforebegin', ' ');
-                }
-            }
-            partialTranscriptElement.textContent = partialText + '...'; // 显示部分结果
-
-        } else if (result.text && result.text.trim()) {
-            const finalText = result.text.trim();
-            let finalSpan;
-
-            if (partialTranscriptElement) {
-                // 如果存在部分结果，用最终结果替换它
-                finalSpan = document.createElement('span');
-                finalSpan.textContent = finalText + '。'; // 加上句号
-                partialTranscriptElement.replaceWith(finalSpan); // 替换节点
-                partialTranscriptElement = null; // 清除引用
+        // Case 1: Partial Result Update
+        if (partialText) {
+            if (currentPartialMessageElement) {
+                // Update existing partial bubble
+                 currentPartialMessageElement.textContent = partialText + '...';
             } else {
-                // 如果没有部分结果，直接添加最终结果
-                finalSpan = document.createElement('span');
-                finalSpan.textContent = finalText + '。'; // 加上句号
-                // 在添加前检查最后一个元素是否是 span，如果是，则在其后加一个空格再添加新的
-                if(transcriptDiv.lastElementChild && transcriptDiv.lastElementChild.tagName === 'SPAN') {
-                    transcriptDiv.appendChild(document.createTextNode(' ')); // 添加空格文本节点
-                }
-                transcriptDiv.appendChild(finalSpan);
+                // Create new partial bubble (previous message must have been final)
+                addMessageBubble(partialText, 'partial');
             }
+            scrollTranscriptToEnd(); // Keep scrolled down as user speaks
         }
-         // 始终滚动到底部以显示最新内容
-        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        // Case 2: Final Result Arrived
+        else if (finalText) {
+            if (currentPartialMessageElement) {
+                // Finalize the existing partial bubble
+                currentPartialMessageElement.textContent = finalText + '。'; // Add punctuation
+                currentPartialMessageElement.classList.remove('message-partial');
+                currentPartialMessageElement.classList.add('message-final');
+                currentPartialMessageElement = null; // Clear reference, it's final now
+            } else {
+                // No preceding partial - just add a new final bubble
+                addMessageBubble(finalText, 'final');
+            }
+            scrollTranscriptToEnd(); // Scroll after final message added/updated
+        }
+        // Case 3: Empty result (e.g., silence detection finished) - potentially finalize partial
+        else if (!partialText && !finalText && currentPartialMessageElement) {
+             // If we get an empty result and have a partial bubble,
+             // it might mean the end of an utterance. Let's finalize it.
+             const currentText = currentPartialMessageElement.textContent.replace(/\.\.\.$/, '').trim();
+             if (currentText) { // Only finalize if there was actual text
+                 currentPartialMessageElement.textContent = currentText + '。';
+                 currentPartialMessageElement.classList.remove('message-partial');
+                 currentPartialMessageElement.classList.add('message-final');
+             } else {
+                 // Remove empty partial bubble
+                 currentPartialMessageElement.remove();
+             }
+             currentPartialMessageElement = null; // Clear reference
+        }
     }
 
 
