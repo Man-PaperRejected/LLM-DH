@@ -1,66 +1,147 @@
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
-import io 
+import io
+import time # Import time for blocking sleep
+from multiprocessing import Process, Queue as MpQueue # Use multiprocessing Queue and Process
+from contextlib import asynccontextmanager # For lifespan manager
+from llm import ds_worker, tts_worker, test_wav
 from vosk import Model, KaldiRecognizer, SetLogLevel
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException # 增加 UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from pydub import AudioSegment 
+from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 import cv2
+# Assuming 'config.py' exists with necessary variables like:
+# VOSK_LOG_LEVEL, VOSK_MODEL_PATH, VOSK_SAMPLE_RATE, TEMPLATES_DIR,
+# CAMERA_INDEX, VIDEO_FPS, JPEG_QUALITY
+import config # Make sure config is imported
+
+# --- Queues (Multiprocessing safe) ---
+# These queues are already multiprocessing.Queue, which is correct for IPC.
+ask_queue= MpQueue()
+answer_queue = MpQueue()
+tts_queue = MpQueue()
+log_queue = MpQueue()
+
 # --- Vosk Configuration ---
-SetLogLevel(0) # Set to -1 to disable logs, 0 for info, 1 for debug
-MODEL_PATH = "model/vosk-model-en-us-0.22" # Path to your downloaded Vosk model
-SAMPLE_RATE = 16000.0 # Vosk model's expected sample rate
+SetLogLevel(config.VOSK_LOG_LEVEL if hasattr(config, 'VOSK_LOG_LEVEL') else -1) # Default if not set
 
 # --- Basic Logging ---
-logging.basicConfig(level=logging.INFO)
+stream_handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(processName)s - %(name)s - %(levelname)s - %(message)s')
+stream_handler.setFormatter(formatter)
+listener = logging.handlers.QueueListener(log_queue, stream_handler)
+listener.start()
+
 logger = logging.getLogger(__name__)
 
 # --- Load Vosk Model ---
-if not os.path.exists(MODEL_PATH):
-    logger.error(f"Vosk model not found at path: {MODEL_PATH}")
+if not os.path.exists(config.VOSK_MODEL_PATH):
+    logger.error(f"Vosk model not found at path: {config.VOSK_MODEL_PATH}")
     exit(1)
 
-logger.info(f"Loading Vosk model from: {MODEL_PATH}")
-# Note: Loading the model can take time and memory.
-# Consider loading it lazily or in a separate thread for large models in production.
-model = Model(MODEL_PATH)
-logger.info("Vosk model loaded successfully.")
+logger.info(f"Loading Vosk model from: {config.VOSK_MODEL_PATH}")
+# Model loading is blocking, done at startup. Fine for now.
+try:
+    model = Model(config.VOSK_MODEL_PATH)
+    logger.info("Vosk model loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load Vosk model: {e}", exc_info=True)
+    exit(1)
+
+
+# --- Lifespan Context Manager for Process Management ---
+processes = []
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages the startup and shutdown of background processes."""
+    logger.info("Application startup: Starting background processes...")
+
+    # Configure logging for multiprocessing if needed (can be tricky)
+    # Consider using QueueHandler for centralized logging from processes
+
+    # Start LLM Process
+    llm_process = Process(target=ds_worker, args=(ask_queue, answer_queue, log_queue), daemon=True)
+    llm_process.start()
+    processes.append(("LLM", llm_process))
+    logger.info(f"LLM process started (PID: {llm_process.pid}).")
+
+    # Start TTS Process
+    tts_process = Process(target=tts_worker, args=(answer_queue, tts_queue, log_queue), daemon=True)
+    tts_process.start()
+    processes.append(("TTS", tts_process))
+    logger.info(f"TTS process started (PID: {tts_process.pid}).")
+    
+    # Start wav2lip Process
+    wav2lip_process = Process(target=test_wav, args=(tts_queue, log_queue))
+    wav2lip_process.start()
+    processes.append(("wav2lip", wav2lip_process))
+
+    yield # Application runs here
+
+    logger.info("Application shutdown: Stopping background processes...")
+    # Send sentinel value (None) to signal processes to stop
+    try:
+         ask_queue.put(None)
+         answer_queue.put(None)
+         tts_queue.put(None)
+    except Exception as e:
+         logger.error(f"Error putting sentinel values in queues: {e}")
+
+    for name, process in processes:
+        try:
+            # Wait for a short time for graceful exit
+            process.join(timeout=5)
+            if process.is_alive():
+                logger.warning(f"Process '{name}' did not exit gracefully, terminating.")
+                process.terminate() # Force terminate if still alive
+                process.join(timeout=1) # Wait briefly for termination
+            else:
+                 logger.info(f"Process '{name}' (PID: {process.pid}) stopped gracefully.")
+        except Exception as e:
+             logger.error(f"Error stopping process '{name}': {e}", exc_info=True)
+
+    # Close queues (optional, helps prevent hangs in some scenarios)
+    ask_queue.close()
+    answer_queue.close()
+    ask_queue.join_thread()
+    answer_queue.join_thread()
+    tts_queue.close()
+    tts_queue.join_thread()
+    logger.info("Background processes stopped and queues closed.")
 
 
 # --- FastAPI App ---
-app = FastAPI()
+# Pass the lifespan manager to the FastAPI constructor
+app = FastAPI(lifespan=lifespan)
 
 # --- Serve Frontend ---
-# Option 1: Serve HTML directly from Python string (simple)
-# (See index_html content in Step 2)
-
-# Option 2: Serve from templates directory (better practice)
-from fastapi.templating import Jinja2Templates
-templates = Jinja2Templates(directory="html")
+templates = Jinja2Templates(directory=config.TEMPLATES_DIR)
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index(request: Request):
-    from fastapi import Request # Import here if using Jinja
     return templates.TemplateResponse("index.html", {"request": request})
 
-# Optional: Mount static files if you have separate CSS/JS
-# app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
 # --- WebSocket Endpoint for Transcription ---
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/mic")
+async def mic_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info(f"WebSocket connection established from: {websocket.client.host}")
+    client_host = websocket.client.host
+    logger.info(f"WebSocket connection established from: {client_host}")
 
     # Create a recognizer instance for this connection
-    # It's crucial to create a new recognizer for each stream.
-    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
-    # recognizer.SetWords(True) # Uncomment if you want word timings
+    try:
+        recognizer = KaldiRecognizer(model, config.VOSK_SAMPLE_RATE)
+        # recognizer.SetWords(True) # Uncomment if you want word timings
+    except Exception as e:
+        logger.error(f"Failed to create KaldiRecognizer for {client_host}: {e}")
+        await websocket.close(code=1011) # Internal error
+        return
 
     last_partial = "" # Keep track of the last partial result to avoid duplicates
 
@@ -69,163 +150,247 @@ async def websocket_endpoint(websocket: WebSocket):
             # Receive audio data (bytes) from the client
             audio_chunk = await websocket.receive_bytes()
 
-            # --- Process Audio with Vosk ---
-            # AcceptWaveform returns True if a partial or final result is available
-            if recognizer.AcceptWaveform(audio_chunk):
-                result_json = recognizer.Result() # Final result for a segment
-                result_dict = json.loads(result_json)
-                text = result_dict.get('text', '')
-                if text: # Only send if there's actual text
-                    logger.info(f"Final Result: {text}")
-                    await websocket.send_text(json.dumps({"type": "final", "text": text}))
-                    last_partial = "" # Reset partial tracking after final result
-            else:
-                partial_json = recognizer.PartialResult()
-                partial_dict = json.loads(partial_json)
-                partial_text = partial_dict.get('partial', '')
+            # --- Process Audio with Vosk (in thread) ---
+            # Run the blocking Vosk functions in a separate thread
+            def process_chunk(rec, chunk):
+                """Blocking function to process audio chunk."""
+                if rec.AcceptWaveform(chunk):
+                    res = json.loads(rec.Result())
+                    return "final", res.get('text', '')
+                else:
+                    partial_res = json.loads(rec.PartialResult())
+                    return "partial", partial_res.get('partial', '')
 
-                # Send partial result ONLY if it's new and not empty
-                if partial_text and partial_text != last_partial:
-                    logger.debug(f"Partial Result: {partial_text}")
-                    await websocket.send_text(json.dumps({"type": "partial", "text": partial_text}))
-                    last_partial = partial_text # Update last sent partial
+            try:
+                 # Use asyncio.to_thread to run the blocking function
+                 result_type, text = await asyncio.to_thread(process_chunk, recognizer, audio_chunk)
+
+                 if result_type == "final" and text:
+                     logger.info(f"Final Result ({client_host}): {text}")
+                     await websocket.send_text(json.dumps({"type": "final", "text": text}))
+                     # Put final recognized text onto the queue for the LLM process
+                     await asyncio.to_thread(ask_queue.put, text) # Use to_thread for queue put
+                     logger.info(f"Sent to LLM queue: '{text}'")
+                     last_partial = "" # Reset partial tracking
+
+                 elif result_type == "partial" and text and text != last_partial:
+                     logger.debug(f"Partial Result ({client_host}): {text}")
+                     await websocket.send_text(json.dumps({"type": "partial", "text": text}))
+                     last_partial = text # Update last sent partial
+
+            except Exception as thread_e:
+                 # Catch errors from within the thread execution
+                 logger.error(f"Error during Vosk processing thread for {client_host}: {thread_e}", exc_info=True)
+                 # Decide if the connection should be closed or just log
+                 # await websocket.close(code=1011)
+                 # break
+
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected from: {websocket.client.host}")
-        # Process any remaining buffered audio for a final result
-        final_json = recognizer.FinalResult()
-        final_dict = json.loads(final_json)
-        final_text = final_dict.get('text', '')
-        if final_text:
-            logger.info(f"Final Result (on disconnect): {final_text}")
-            # We can't send to a disconnected client, but we log it.
+        logger.info(f"WebSocket disconnected from: {client_host}")
+        # Process any remaining buffered audio for a final result (in thread)
+        def final_process(rec):
+            final_res = json.loads(rec.FinalResult())
+            return final_res.get('text', '')
+
+        try:
+            # Run final processing in a thread
+            final_text = await asyncio.to_thread(final_process, recognizer)
+            if final_text:
+                logger.info(f"Final Result (on disconnect from {client_host}): {final_text}")
+                # Also send this last bit to LLM if needed
+                await asyncio.to_thread(ask_queue.put, final_text)
+                logger.info(f"Sent final (on disconnect) to LLM queue: '{final_text}'")
+        except Exception as final_e:
+             logger.error(f"Error during final Vosk processing on disconnect for {client_host}: {final_e}", exc_info=True)
+
     except Exception as e:
-        logger.error(f"Error during WebSocket communication: {e}")
+        # Catch other WebSocket errors
+        logger.error(f"Error during WebSocket communication with {client_host}: {e}", exc_info=True)
     finally:
         # Clean up recognizer if needed (though Python GC usually handles it)
-        logger.info(f"Closing connection processing for: {websocket.client.host}")
+        logger.info(f"Closing connection processing for: {client_host}")
+        # Ensure websocket is closed if not already
+        try:
+            await websocket.close()
+        except RuntimeError: # Can happen if already closed
+            pass
 
-# --- 新增：文件上传识别路由 ---
+
+# --- 文件上传识别路由 (Modified to put result on queue) ---
 @app.post("/upload_audio/", response_class=JSONResponse)
 async def handle_audio_upload(audio_file: UploadFile = File(...)):
     """
-    接收上传的音频文件，使用 pydub 进行转换，然后用 Vosk 识别 (非阻塞方式)。
+    Receives uploaded audio, converts with pydub, transcribes with Vosk (non-blocking),
+    and puts the result onto the ask_queue.
     """
-    logger.info(f"接收到上传文件: {audio_file.filename}, 类型: {audio_file.content_type}")
+    logger.info(f"Received uploaded file: {audio_file.filename}, Type: {audio_file.content_type}")
 
     if not audio_file.content_type or not audio_file.content_type.startswith("audio/"):
-        logger.warning(f"上传了非音频类型文件: {audio_file.content_type}")
-        raise HTTPException(status_code=400, detail="无效的文件类型，请上传音频文件。")
+        logger.warning(f"Uploaded non-audio file type: {audio_file.content_type}")
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an audio file.")
 
-    # 为本次请求创建一个新的识别器
-    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+    # Create a NEW recognizer for this specific request
+    # Crucial: Do not reuse recognizers across different audio streams/files
+    try:
+        recognizer = KaldiRecognizer(model, config.VOSK_SAMPLE_RATE)
+    except Exception as e:
+        logger.error(f"Failed to create KaldiRecognizer for upload {audio_file.filename}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error: Could not initialize recognizer.")
+
     full_text = ""
 
     try:
-        # 1. 读取上传文件的内容 (async)
         contents = await audio_file.read()
-        logger.info(f"文件读取完毕，大小: {len(contents)} 字节")
+        logger.info(f"File read complete, size: {len(contents)} bytes")
 
-        # --- 将阻塞的 pydub 和 Vosk 操作移至线程 ---
-        def process_audio_sync(audio_data):
-            nonlocal full_text # Allow modifying the outer scope variable
+        # --- Process Audio in Thread ---
+        def process_audio_sync(audio_data, rec):
             try:
-                logger.info("使用 pydub 进行音频转换 (in thread)...")
+                logger.info("Using pydub for audio conversion (in thread)...")
                 audio_stream = io.BytesIO(audio_data)
-                audio = AudioSegment.from_file(audio_stream) # Blocking decode
-                audio = audio.set_channels(1).set_frame_rate(int(SAMPLE_RATE)) # Blocking CPU
-                logger.info(f"音频已转换为: 单声道, {SAMPLE_RATE} Hz (in thread)")
+                # Explicitly provide format if possible, otherwise pydub guesses
+                # Example: audio = AudioSegment.from_file(audio_stream, format="wav")
+                try:
+                    audio = AudioSegment.from_file(audio_stream) # Blocking decode
+                except CouldntDecodeError as cd_err:
+                     logger.error(f"Pydub failed to decode {audio_file.filename}. Ensure ffmpeg/libav is installed and supports the format. Error: {cd_err}")
+                     raise HTTPException(status_code=400, detail=f"Could not decode audio file '{audio_file.filename}'. Check format or server setup (ffmpeg/libav).") from cd_err
+
+                # Ensure correct sample rate and channels for Vosk
+                target_sr = int(config.VOSK_SAMPLE_RATE)
+                if audio.frame_rate != target_sr or audio.channels != 1:
+                    audio = audio.set_channels(1).set_frame_rate(target_sr) # Blocking CPU
+                    logger.info(f"Audio converted to: Mono, {target_sr} Hz (in thread)")
+                else:
+                     logger.info(f"Audio already in correct format: Mono, {target_sr} Hz (in thread)")
+
                 raw_audio_data = audio.raw_data # Blocking
 
-                logger.info("开始 Vosk 识别 (in thread)...")
-                # 处理整个音频
-                recognizer.AcceptWaveform(raw_audio_data) # Blocking CPU
-                result = json.loads(recognizer.Result()) # Blocking CPU
+                logger.info("Starting Vosk recognition (in thread)...")
+                rec.AcceptWaveform(raw_audio_data) # Blocking CPU
+                result = json.loads(rec.Result()) # Blocking CPU
                 _full_text = result.get('text', '')
 
-                # 获取可能残留的最后部分
-                final_result = json.loads(recognizer.FinalResult()) # Blocking CPU
-                _full_text += final_result.get('text', '')
+                # Get final result (though Result() often contains everything for complete files)
+                # final_result = json.loads(rec.FinalResult()) # Blocking CPU
+                # _full_text += final_result.get('text', '') # Usually empty if Result() was called after full waveform
+
+                logger.info(f"Vosk recognition complete (in thread). Text found: {bool(_full_text)}")
                 return _full_text.strip()
 
-            except CouldntDecodeError as cd_err:
-                 logger.error(f"无法解码音频文件 (in thread): {audio_file.filename}. {cd_err}")
-                 # Re-raise a specific exception type or return an error indicator
-                 raise HTTPException(status_code=400, detail="无法解码音频文件。请检查文件格式或确保服务器安装了 ffmpeg/libav。") from cd_err
+            except HTTPException: # Re-raise HTTP exceptions from inner scope
+                 raise
             except Exception as inner_e:
-                 logger.error(f"处理音频线程内部错误: {inner_e}", exc_info=True)
-                 raise HTTPException(status_code=500, detail=f"处理音频时发生内部错误: {inner_e}") from inner_e
+                 logger.error(f"Error processing audio in thread for {audio_file.filename}: {inner_e}", exc_info=True)
+                 raise HTTPException(status_code=500, detail=f"Internal error during audio processing: {inner_e}") from inner_e
 
+        # Run the synchronous processing function in a thread
+        full_text = await asyncio.to_thread(process_audio_sync, contents, recognizer)
 
-        # 使用 asyncio.to_thread 运行同步处理函数
-        full_text = await asyncio.to_thread(process_audio_sync, contents)
+        if full_text:
+            # Put the result onto the multiprocessing queue (using to_thread for the put)
+            await asyncio.to_thread(ask_queue.put, full_text)
+            logger.info(f"File recognition complete: '{full_text}'. Sent to LLM queue.")
+        else:
+            logger.warning(f"Uploaded file '{audio_file.filename}' did not produce any recognized text.")
 
-        logger.info(f"文件识别完成: {full_text}")
-        return JSONResponse(content={"transcription": full_text})
+        return JSONResponse(content={"transcription": full_text if full_text else "No text recognized."})
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions directly
         raise http_exc
     except Exception as e:
-        logger.error(f"处理上传文件时发生错误: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"处理音频文件时发生外部错误: {e}")
+        logger.error(f"Error handling uploaded file '{audio_file.filename}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing uploaded audio file: {e}")
     finally:
-        await audio_file.close() # 确保关闭文件句柄
-         
+        await audio_file.close() # Ensure file handle is closed
+
+# --- Video Streaming Endpoint (Unchanged conceptually) ---
 async def gen_camera():
-    """异步生成器，用于非阻塞地读取和编码摄像头帧"""
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        logger.error("无法打开摄像头")
-        # 在异步生成器中引发异常可能不会很好地被框架捕获，
-        # 更好的方法是 yield 一个错误指示或提前返回。
-        # 这里我们先记录错误并退出生成器。
-        return # 或者 yield b'error: could not open camera'
-
-    logger.info("摄像头已打开")
+    # Use camera index from config
+    cap = None # Initialize to None
     try:
+        cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        if not cap.isOpened():
+            logger.error(f"Cannot open camera index: {config.CAMERA_INDEX}")
+            # Yield an error message or image? For now, just stop.
+            return
+        logger.info(f"Camera {config.CAMERA_INDEX} opened successfully.")
+        # Use FPS and quality from config
+        frame_delay = 1.0 / config.VIDEO_FPS if config.VIDEO_FPS > 0 else 0.033 # Default to ~30fps if 0
+
         while True:
-            # 在线程中运行阻塞的 cap.read()
+            start_time = asyncio.get_event_loop().time()
+
+            # Run blocking cap.read() in a thread
             ret, frame = await asyncio.to_thread(cap.read)
-            if not ret:
-                logger.warning("无法从摄像头读取帧，可能已断开连接")
-                await asyncio.sleep(0.5) # 等待一下再试
+
+            if not ret or frame is None:
+                logger.warning(f"Failed to grab frame from camera {config.CAMERA_INDEX}. Retrying...")
+                # Avoid busy-looping if the camera fails continuously
+                await asyncio.sleep(0.5)
+                # Optionally try reopening the camera here?
                 continue
 
-            # 在线程中运行阻塞的 cv2.imencode()
-            encode_ret, jpeg = await asyncio.to_thread(cv2.imencode, '.jpg', frame)
+            # Run blocking cv2.imencode() in a thread
+            encode_ret, jpeg = await asyncio.to_thread(
+                cv2.imencode, '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY]
+            )
+
             if not encode_ret:
-                logger.warning("无法将帧编码为 JPEG")
+                logger.warning("Failed to encode frame to JPEG.")
                 continue
 
-            # 异步地 yield 帧数据
+            # Yield the frame bytes for the streaming response
             yield (
                 b'--frame\r\n'
                 b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
             )
-            # 短暂 sleep 以允许其他任务运行，避免 CPU 占用过高
-            # 同时也控制了帧率（大约）
-            await asyncio.sleep(0.03) # 大约 30fps，可以调整
 
+            # Calculate sleep duration to approximate target FPS
+            processing_time = asyncio.get_event_loop().time() - start_time
+            sleep_duration = max(0, frame_delay - processing_time)
+            await asyncio.sleep(sleep_duration)
+
+    except asyncio.CancelledError:
+         logger.info(f"Video stream for camera {config.CAMERA_INDEX} cancelled.")
     except Exception as e:
-        logger.error(f"视频流生成过程中发生错误: {e}", exc_info=True)
+        logger.error(f"Error in video stream generator for camera {config.CAMERA_INDEX}: {e}", exc_info=True)
     finally:
-        logger.info("正在释放摄像头资源...")
-        # 确保 cap.release() 也在线程中运行（如果它可能阻塞的话）
-        # 通常 release 很快，但以防万一
-        await asyncio.to_thread(cap.release)
-        logger.info("摄像头资源已释放")
+        if cap and cap.isOpened():
+            logger.info(f"Releasing camera {config.CAMERA_INDEX} resources...")
+            # Run blocking cap.release() in a thread
+            await asyncio.to_thread(cap.release)
+            logger.info(f"Camera {config.CAMERA_INDEX} resources released.")
+        else:
+             logger.info(f"Camera {config.CAMERA_INDEX} was not open or already released.")
 
 
 @app.get("/video_feed")
 async def video_feed():
-    """提供视频流的端点"""
-    logger.info("请求视频流")
+    logger.info(f"Request received for video stream /video_feed (Source: Camera {config.CAMERA_INDEX})")
     return StreamingResponse(gen_camera(), media_type='multipart/x-mixed-replace; boundary=frame')
 
 
-# --- Add a simple health check endpoint (optional) ---
+# --- Health Check Endpoint (Unchanged) ---
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "model_loaded": model is not None}
+    # Basic check: app is running and model seems loaded
+    model_status = "loaded" if 'model' in globals() and model is not None else "not loaded"
+    # Check process health (simple check if they are alive)
+    process_status = {}
+    for name, process in processes:
+         process_status[f"{name}_process_alive"] = process.is_alive() if process else False
+
+    return {"status": "ok", "model_status": model_status, **process_status}
+
+# --- Main execution block (for running with uvicorn directly) ---
+# if __name__ == "__main__":
+#     import uvicorn
+#     # Note: Running directly like this might have issues with multiprocessing
+#     # on some OSes (especially Windows). It's generally better to run with
+#     # uvicorn command line: uvicorn your_module_name:app --reload
+#     logger.info("Starting FastAPI application with uvicorn...")
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
 

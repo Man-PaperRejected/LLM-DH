@@ -72,7 +72,6 @@
             box-sizing: border-box;
             display: flex;
             flex-direction: column;
-            /*height: 100%;*/
             flex-grow: 1;
             min-height: 0;
             height: 100%;
@@ -83,7 +82,6 @@
             padding: 15px;
             border: 1px solid #ccc;
             min-height: 100px;
-            height: calc(100% - 150px);
             overflow-y: auto;
             scrollbar-width: thin;
             background-color: #f9f9f9;
@@ -167,6 +165,14 @@
             word-wrap: break-word; /* Wrap long words */
             line-height: 1.4;
             box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }
+
+        .message-assistant {
+            background-color: #74c727; /* Light blue background */
+            color: #333;
+            border: 1px solid #74c727;
+            align-self: flex-start; /* Align to the left */
+            border-bottom-left-radius: 3px; /* Make it look like a speech bubble */
         }
 
         /* Style for Finalized User Messages (Recognized Speech) */
@@ -299,7 +305,7 @@
     let partialTranscriptElement = null; // 用于跟踪当前的部分结果元素
 
     // --- WebSocket 地址 ---
-    const wsUrl = `ws://${window.location.host}/ws`;
+    const wsUrl = `ws://${window.location.host}/mic`;
 
     // --- 音频参数 ---
     const TARGET_SAMPLE_RATE = 16000;
@@ -338,6 +344,10 @@
                  break;
             case 'error':
                 messageDiv.classList.add('message-error');
+                messageDiv.textContent = text;
+                break;
+            case 'assist':
+                messageDiv.classList.add('message-assistant');
                 messageDiv.textContent = text;
                 break;
             case 'final':

@@ -1,0 +1,3 @@
+[submodule "3rdrepo/Wav2lip"]
+	path = 3rdrepo/Wav2lip
+	url = https://github.com/Rudrabha/Wav2Lip.git
