@@ -35,8 +35,8 @@ JPEG_QUALITY = 80       # Quality for encoding video frames (0-100)
 
 # --- TTS Setting ---
 TTS_VOICE = "zh-CN-YunxiNeural"  
-TTS_SPEED = "+0%"                # (-50% to +100%）
-TTS_VOLUME = "+0%"               # （-50% to +50%）
+TTS_SPEED = "-20%"                # (-50% to +100%）
+TTS_VOLUME = "+10%"               # （-50% to +50%）
 TTS_PITCH = "+0Hz"              # （-50Hz to +50Hz）
 
 # --- Audio Processing ---
@@ -45,3 +45,25 @@ TTS_PITCH = "+0Hz"              # （-50Hz to +50Hz）
 
 # --- Queues (No configurable values here, just used internally) ---
 
+# --- HLS
+OUTPUT_STREAM_URL = "hls_stream/stream.m3u8"
+DHVG_VIDEO_WIDTH = 536
+DHVG_VIDEO_HEIGHT = 960
+DHVG_VIDEO_FRAMERATE = 24
+DHVG_VIDEO_PIXFMT = 'bgr24'
+
+DHVG_AUDIO_FORMAT = 's16le'
+DHVG_AUDIO_SAMPLE_RATE = 16000
+DHVG_AUDIO_CHANNELS = 1
+
+FFMPEG_VCODEC = 'libx264'
+FFMPEG_PIXFMT = 'yuv420p'
+FFMPEG_PRESET = 'veryfast'
+FFMPEG_GOP = 50
+FFMPEG_VBITRATE = '2500k'
+FFMPEG_ACODEC = 'aac'
+FFMPEG_ABITRATE = '128k'
+FFMPEG_ARATE = 44100
+FFMPEG_ACHANNELS = 2
+FFMPEG_BUFSIZE = '5000k'
+FFMPEG_FORMAT = 'hls'

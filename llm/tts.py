@@ -18,7 +18,7 @@ async def _synthesize_and_get_raw_audio(text: str, voice_name: str, logger: logg
     Returns (None, None) on failure during synthesis.
     """
     logger.info(f"Starting TTS synthesis for text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
-    communicate = Communicate(text, voice_name)
+    communicate = Communicate(text, voice_name, rate="-50%")
     audio_chunks = []
     word_boundaries = []
 
@@ -142,7 +142,7 @@ def tts_worker(answer_q: MpQueue, tts_q: MpQueue, log_q: MpQueue,
 
             # --- 4. Push processed audio to tts_q ---
             if processed_audio_bytes:
-                logger.debug(f"Putting processed PCM audio chunk (size: {len(processed_audio_bytes)}) into tts_q.")
+                logger.info(f"Putting processed PCM audio chunk (size: {len(processed_audio_bytes)}) into tts_q.")
                 tts_q.put(processed_audio_bytes)
             else:
                 logger.warning("Audio processing resulted in empty data, not putting into queue.")

@@ -250,7 +250,7 @@
 <div class="main-container">
     <!-- 左侧：数字人区域 -->
     <div id="digitalHumanArea">
-        <img id="dh-video" src="/video_feed"  >
+        <video id="dh-video" muted autoplay style="width:100%; height:auto;"></video>
         <!-- <img src="your-image.jpg" alt="数字人" style="max-width: 100%; max-height: 100%;"> -->
     </div>
 
@@ -282,7 +282,7 @@
     </div>
 </div>
 
-
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
     // JavaScript 部分保持不变，因为它通过 ID 选择元素，
     // 并且布局的改变不影响其功能逻辑。
@@ -306,11 +306,12 @@
 
     // --- WebSocket 地址 ---
     const wsUrl = `ws://${window.location.host}/mic`;
+    const llmWsUrl  = `ws://${window.location.host}/llm_stream`;
 
     // --- 音频参数 ---
     const TARGET_SAMPLE_RATE = 16000;
     const BUFFER_SIZE = 4096;
-
+    
     // --- Helper: Scroll transcript to bottom ---
     function scrollTranscriptToEnd() {
         setTimeout(() => {
@@ -346,8 +347,9 @@
                 messageDiv.classList.add('message-error');
                 messageDiv.textContent = text;
                 break;
-            case 'assist':
+            case 'llm_answer':
                 messageDiv.classList.add('message-assistant');
+                messageDiv.textContent = `assistant: ${text}`;
                 messageDiv.textContent = text;
                 break;
             case 'final':
@@ -609,51 +611,73 @@
     }
 
    // --- 更新转录文本显示 ---
-    function updateTranscript(result) {
-        const partialText = result.partial ? result.partial.trim() : null;
-        const finalText = result.text ? result.text.trim() : null;
-
-        // Case 1: Partial Result Update
-        if (partialText) {
-            if (currentPartialMessageElement) {
-                // Update existing partial bubble
-                 currentPartialMessageElement.textContent = partialText + '...';
-            } else {
-                // Create new partial bubble (previous message must have been final)
-                addMessageBubble(partialText, 'partial');
-            }
-            scrollTranscriptToEnd(); // Keep scrolled down as user speaks
-        }
-        // Case 2: Final Result Arrived
-        else if (finalText) {
-            if (currentPartialMessageElement) {
-                // Finalize the existing partial bubble
-                currentPartialMessageElement.textContent = finalText + '。'; // Add punctuation
-                currentPartialMessageElement.classList.remove('message-partial');
-                currentPartialMessageElement.classList.add('message-final');
-                currentPartialMessageElement = null; // Clear reference, it's final now
-            } else {
-                // No preceding partial - just add a new final bubble
-                addMessageBubble(finalText, 'final');
-            }
-            scrollTranscriptToEnd(); // Scroll after final message added/updated
-        }
-        // Case 3: Empty result (e.g., silence detection finished) - potentially finalize partial
-        else if (!partialText && !finalText && currentPartialMessageElement) {
-             // If we get an empty result and have a partial bubble,
-             // it might mean the end of an utterance. Let's finalize it.
-             const currentText = currentPartialMessageElement.textContent.replace(/\.\.\.$/, '').trim();
-             if (currentText) { // Only finalize if there was actual text
-                 currentPartialMessageElement.textContent = currentText + '。';
-                 currentPartialMessageElement.classList.remove('message-partial');
-                 currentPartialMessageElement.classList.add('message-final');
-             } else {
-                 // Remove empty partial bubble
-                 currentPartialMessageElement.remove();
-             }
-             currentPartialMessageElement = null; // Clear reference
-        }
+   function updateTranscript(result) {
+    // 先检查是否存在明确的错误字段 (兼容旧格式或特定错误上报)
+    if (result.error) {
+        console.error("服务器明确报告错误:", result.error);
+        addMessageBubble(`错误: ${result.error}`, 'error');
+        // 可以选择根据错误类型决定是否停止录音等操作
+        // stopRecording();
+        return; // 错误处理完毕，直接返回
     }
+
+    // 根据消息类型调用 addMessageBubble
+    switch (result.type) {
+        case 'final':
+            const finalText = result.text ? result.text.trim() : '';
+            if (finalText) { // 仅在有文本时添加
+                addMessageBubble(finalText, 'final');
+            } else if (currentPartialMessageElement) {
+                // 如果收到空的 final 且存在 partial，则移除空的 partial
+                currentPartialMessageElement.remove();
+                currentPartialMessageElement = null;
+            }
+            break;
+
+        case 'partial':
+            const partialText = result.text ? result.text.trim() : null; // 假设部分结果也在 .text 中
+            // const partialText = result.partial ? result.partial.trim() : null; // 或者如果部分结果仍在 .partial 中
+            if (partialText) {
+                addMessageBubble(partialText, 'partial');
+            } else if (currentPartialMessageElement) {
+                 // 如果收到空的 partial 且存在 partial 元素，可以选择移除或保留
+                 // currentPartialMessageElement.remove();
+                 // currentPartialMessageElement = null;
+                 // 或者保持不动，等 final 结果来覆盖或超时处理
+            }
+            break;
+
+        case 'llm_answer':
+            const answerText = result.text ? result.text.trim() : '';
+            if (answerText) {
+                addMessageBubble(answerText, 'llm_answer');
+            }
+            break;
+
+        case 'error': // 处理由 onmessage 的 catch 或服务器直接发送的 error 类型
+             const errorText = result.text || result.message || '未知错误'; // 尝试获取错误文本
+             addMessageBubble(`错误: ${errorText}`, 'error');
+             break;
+
+        default:
+            // 处理未知类型或没有明确文本的消息
+            // 也许可以记录一个警告，或者根据情况决定是否显示什么
+            console.warn("收到未知或无有效内容的消息类型:", result);
+            // 如果当前有部分消息，收到未知消息可能意味着结束，可以考虑固化或移除
+            if (currentPartialMessageElement) {
+                 const currentText = currentPartialMessageElement.textContent.replace('你 (输入中...): ','').replace(/\.\.\.$/, '').trim();
+                 if (currentText) {
+                     currentPartialMessageElement.textContent = `你: ${currentText}`; // 改为最终样式
+                     currentPartialMessageElement.classList.remove('message-partial');
+                     currentPartialMessageElement.classList.add('message-final');
+                 } else {
+                     currentPartialMessageElement.remove();
+                 }
+                 currentPartialMessageElement = null;
+            }
+            break;
+    }
+}
 
 
     // --- 音频格式转换和重采样函数 ---
@@ -682,6 +706,84 @@
         return outputBuffer.buffer; // 返回 ArrayBuffer
     }
 
+    function connectLLMStream() {
+        if (llmWebsocket && llmWebsocket.readyState === WebSocket.OPEN) {
+            console.log("LLM Stream WebSocket 已连接."); // LLM Stream WebSocket already connected.
+            uploadButton.disabled = false; // Enable upload button if connected
+            return; // Already connected
+        }
+
+        console.log("正在连接 LLM Stream WebSocket..."); // Connecting LLM Stream WebSocket...
+        llmWebsocket = new WebSocket(llmWsUrl);
+
+        llmWebsocket.onopen = () => {
+            console.log("LLM Stream WebSocket 连接成功."); // LLM Stream WebSocket connection successful.
+             // Enable upload button only when LLM stream is connected
+             uploadButton.disabled = false;
+             statusFile.textContent = '状态: 已连接，可上传文件'; // Indicate ready state for file upload
+        };
+
+        llmWebsocket.onmessage = (event) => {
+            try {
+                const result = JSON.parse(event.data);
+                console.log("LLM Stream 收到消息:", result); // LLM Stream received message
+                updateTranscript(result); // Process LLM answers or file results
+
+                 // If it was a file result, update file status
+                 if (result.type === 'file') {
+                     statusFile.textContent = '状态: 文件处理完成!';
+                     statusFile.classList.remove('error');
+                      // Re-enable upload button after processing is fully done
+                      uploadButton.disabled = false;
+                      audioFileInput.disabled = false;
+                 }
+
+            } catch (e) {
+                console.error("解析 LLM Stream 消息失败:", e, "原始数据:", event.data); // Failed to parse LLM Stream message
+                updateTranscript({ type: 'error', text: '无法解析 LLM Stream 响应' }); // Cannot parse LLM Stream response
+            }
+        };
+
+        llmWebsocket.onerror = (event) => {
+            console.error("LLM Stream WebSocket 错误:", event); // LLM Stream WebSocket error
+            addMessageBubble("LLM Stream 连接错误", "error");
+             uploadButton.disabled = true; // Disable upload on error
+             statusFile.textContent = '状态: LLM Stream 连接错误';
+             statusFile.classList.add('error');
+        };
+
+        llmWebsocket.onclose = (event) => {
+            console.log("LLM Stream WebSocket 关闭:", event.code, event.reason); // LLM Stream WebSocket closed
+            addMessageBubble("LLM Stream 连接已断开", "status");
+            llmWebsocket = null; // Clear reference
+             uploadButton.disabled = true; // Disable upload on close
+             statusFile.textContent = '状态: LLM Stream 连接已断开';
+        };
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+
+
+        const video = document.getElementById('dh-video');
+        const hlsUrl = '/live/stream.m3u8'; // 必须与FastAPI路由匹配
+        
+        if (Hls.isSupported()) {
+            const hls = new Hls();
+            hls.loadSource(hlsUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                video.play();
+            });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari原生支持
+            video.src = hlsUrl;
+            video.addEventListener('loadedmetadata', () => {
+                video.play();
+            });
+        } else {
+            console.error("浏览器不支持HLS播放");
+        }
+    });
 </script>
 
 </body>

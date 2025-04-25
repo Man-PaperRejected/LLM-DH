@@ -3,14 +3,19 @@ import json
 import logging
 import logging.handlers
 import os
+import fcntl
 import io
 import time # Import time for blocking sleep
+import multiprocessing
 from multiprocessing import Process, Queue as MpQueue # Use multiprocessing Queue and Process
 from contextlib import asynccontextmanager # For lifespan manager
-from llm import ds_worker, tts_worker, test_wav
+from llm import ds_worker, tts_worker
+from dh.wav2lip.wav2lip import wav2lip
+from hls import ffmpeg_worker
 from vosk import Model, KaldiRecognizer, SetLogLevel
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
@@ -20,13 +25,32 @@ import cv2
 # CAMERA_INDEX, VIDEO_FPS, JPEG_QUALITY
 import config # Make sure config is imported
 
+# --- HLS Video  ---
+import mimetypes
+mimetypes.add_type('application/vnd.apple.mpegurl', '.m3u8')
+mimetypes.add_type('video/mp2t', '.ts')
+
+HLS_OUTPUT_DIR = "./hls_stream"  
+os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
+
+# --- Pipe File Descriptors (will be initialized in lifespan) ---
+multiprocessing.set_start_method('fork', force=True)
+PIPE_BUF_SIZE = 1048576  # 1MB
+video_pipe_r_fd = None
+video_pipe_w_fd = None
+audio_pipe_r_fd = None
+audio_pipe_w_fd = None
+
 # --- Queues (Multiprocessing safe) ---
 # These queues are already multiprocessing.Queue, which is correct for IPC.
 ask_queue= MpQueue()
 answer_queue = MpQueue()
+llm_queue = MpQueue()
 tts_queue = MpQueue()
 log_queue = MpQueue()
 
+active_connections: set[WebSocket] = set()
+llm_stream_connections: set[WebSocket] = set()
 # --- Vosk Configuration ---
 SetLogLevel(config.VOSK_LOG_LEVEL if hasattr(config, 'VOSK_LOG_LEVEL') else -1) # Default if not set
 
@@ -37,7 +61,11 @@ stream_handler.setFormatter(formatter)
 listener = logging.handlers.QueueListener(log_queue, stream_handler)
 listener.start()
 
-logger = logging.getLogger(__name__)
+queue_handler = logging.handlers.QueueHandler(log_queue)
+logger = logging.getLogger("Main")
+logger.setLevel(logging.INFO)
+logger.handlers = []  # 移除默认handlers，防止重复
+logger.addHandler(queue_handler)
 
 # --- Load Vosk Model ---
 if not os.path.exists(config.VOSK_MODEL_PATH):
@@ -53,39 +81,183 @@ except Exception as e:
     logger.error(f"Failed to load Vosk model: {e}", exc_info=True)
     exit(1)
 
+async def broadcast_llm_stream():
+    """
+    Monitors llm_queue and broadcasts messages to clients connected to /llm_stream.
+    """
+    logger.info("LLM Stream广播任务已启动") # Broadcast task for LLM stream started
+    while True:
+        try:
+            # Get data from the LLM queue (non-blocking via asyncio.to_thread)
+            message_data = await asyncio.to_thread(llm_queue.get)
+
+            if message_data is None:  # Check for stop signal
+                logger.info("LLM Stream广播器收到停止信号") # LLM Stream broadcaster received stop signal
+                break
+
+            # Ensure message_data is serializable (e.g., dict or string)
+            # If it's just text, wrap it in a dict for consistency
+            if isinstance(message_data, str):
+                 message_payload = json.dumps({"type": "llm_answer", "text": message_data})
+            elif isinstance(message_data, dict):
+                 # Assume it already has 'type', 'text', etc.
+                 message_payload = json.dumps(message_data)
+            else:
+                 logger.warning(f"LLM Stream广播器收到未知格式数据: {type(message_data)}") # LLM Stream broadcaster received unknown data format
+                 continue # Skip broadcasting this item
+
+            logger.info(f"正在向 {len(llm_stream_connections)} 个 LLM Stream 客户端广播: {message_payload}") # Broadcasting to N LLM Stream clients
+
+            # Use list comprehension for potentially removing dead connections safely
+            disconnected_clients = []
+            for connection in llm_stream_connections:
+                try:
+                    await connection.send_text(message_payload)
+                except (WebSocketDisconnect, RuntimeError) as e:
+                    logger.warning(f"发送到LLM Stream客户端时出错，准备移除: {e}") # Error sending to LLM Stream client, preparing removal
+                    disconnected_clients.append(connection)
+                except Exception as e:
+                    logger.error(f"发送到LLM Stream客户端时发生意外错误: {e}", exc_info=True) # Unexpected error sending to LLM Stream client
+                    disconnected_clients.append(connection) # Also remove on unexpected errors
+
+            # Remove dead connections *after* iteration
+            for client in disconnected_clients:
+                if client in llm_stream_connections:
+                     llm_stream_connections.remove(client)
+                     logger.info(f"已从 LLM Stream 移除断开的客户端. 当前数量: {len(llm_stream_connections)}") # Removed disconnected client from LLM Stream. Current count: N
+
+        except asyncio.CancelledError:
+             logger.info("LLM Stream广播任务被取消") # LLM Stream broadcast task cancelled
+             break
+        except Exception as e:
+            logger.error(f"LLM Stream广播任务出错: {e}", exc_info=True) # LLM Stream broadcast task error
+            await asyncio.sleep(1) # Avoid busy-looping on errors
+    logger.info("LLM Stream广播任务已完成") # LLM Stream broadcast task finished
 
 # --- Lifespan Context Manager for Process Management ---
 processes = []
+broadcast_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages the startup and shutdown of background processes."""
     logger.info("Application startup: Starting background processes...")
 
-    # Configure logging for multiprocessing if needed (can be tricky)
-    # Consider using QueueHandler for centralized logging from processes
+    # Pipes for DHVG -> FFmpeg communication
+    try:
+        video_pipe_r_fd, video_pipe_w_fd = os.pipe()
+        logger.info(f"Created video pipe: R={video_pipe_r_fd}, W={video_pipe_w_fd}")
+        audio_pipe_r_fd, audio_pipe_w_fd = os.pipe()
+        logger.info(f"Created audio pipe: R={audio_pipe_r_fd}, W={audio_pipe_w_fd}")
+        
+        fcntl.fcntl(video_pipe_w_fd, fcntl.F_SETPIPE_SZ, PIPE_BUF_SIZE)
+        fcntl.fcntl(video_pipe_r_fd, fcntl.F_SETPIPE_SZ, PIPE_BUF_SIZE)
+        fcntl.fcntl(audio_pipe_w_fd, fcntl.F_SETPIPE_SZ, PIPE_BUF_SIZE)
+        fcntl.fcntl(audio_pipe_r_fd, fcntl.F_SETPIPE_SZ, PIPE_BUF_SIZE)
+        
+        os.set_inheritable(video_pipe_r_fd, True)
+        os.set_inheritable(video_pipe_w_fd, True)
+        os.set_inheritable(audio_pipe_r_fd, True)
+        os.set_inheritable(audio_pipe_w_fd, True)
+        
+    except OSError as e:
+        logger.error(f"Failed to create pipes: {e}", exc_info=True)
+        # Handle error appropriately - maybe exit?
+        raise RuntimeError("Failed to create necessary pipes") from e
 
     # Start LLM Process
-    llm_process = Process(target=ds_worker, args=(ask_queue, answer_queue, log_queue), daemon=True)
-    llm_process.start()
-    processes.append(("LLM", llm_process))
-    logger.info(f"LLM process started (PID: {llm_process.pid}).")
+    try:
+        llm_process = Process(target=ds_worker, args=(ask_queue, answer_queue, llm_queue, log_queue), daemon=True)
+        llm_process.start()
+        processes.append(("LLM", llm_process))
+        logger.info(f"LLM process started (PID: {llm_process.pid}).")
+    except:
+        logger.error(f"Failed to start LLM process: {e}", exc_info=True)
 
     # Start TTS Process
-    tts_process = Process(target=tts_worker, args=(answer_queue, tts_queue, log_queue), daemon=True)
-    tts_process.start()
-    processes.append(("TTS", tts_process))
-    logger.info(f"TTS process started (PID: {tts_process.pid}).")
-    
+    try:
+        tts_process = Process(target=tts_worker, args=(answer_queue, tts_queue, log_queue), daemon=True)
+        tts_process.start()
+        processes.append(("TTS", tts_process))
+        logger.info(f"TTS process started (PID: {tts_process.pid}).")
+    except:
+        logger.error(f"Failed to start TTS process: {e}", exc_info=True)
+
     # Start wav2lip Process
-    wav2lip_process = Process(target=test_wav, args=(tts_queue, log_queue))
-    wav2lip_process.start()
-    processes.append(("wav2lip", wav2lip_process))
+    try:
+        # os.close(video_pipe_r_fd)c
+        # os.close(audio_pipe_r_fd)
+        wav2lip_process = Process(target=wav2lip, args=(tts_queue, log_queue, video_pipe_w_fd, audio_pipe_w_fd), daemon=True)
+        wav2lip_process.start()
+        processes.append(("wav2lip", wav2lip_process))
+        os.close(video_pipe_w_fd)
+        os.close(audio_pipe_w_fd)
+        video_pipe_w_fd = audio_pipe_w_fd = -1
+    except Exception as e:
+        logger.error(f"Failed to start wav2lip process: {e}", exc_info=True)
+        # Close write ends if DHVG failed to start?
+        if video_pipe_w_fd is not None: os.close(video_pipe_w_fd)
+        if audio_pipe_w_fd is not None: os.close(audio_pipe_w_fd)
+        
+    try:
+        logger.info("Starting LLM answer broadcaster task...")
+        broadcast_task = asyncio.create_task(broadcast_llm_stream())
+        logger.info("LLM Broadcast task created")
+    except:
+        logger.error("LLM Broadcast task Failed")
+    
+    time.sleep(45)
+    # Start ffmpeg Process
+    try:
+        logger.info(f"PARENT: Passing FDs to ffmpeg_worker: Video={video_pipe_r_fd}, Audio={audio_pipe_r_fd}")
+        # Check if these values are valid integers (e.g., >= 0)
+        if not isinstance(video_pipe_r_fd, int) or video_pipe_r_fd < 0 or \
+        not isinstance(audio_pipe_r_fd, int) or audio_pipe_r_fd < 0:
+            logger.error("PARENT: Invalid FD values detected before passing to FFmpeg process!")
+            
+        output_stream_url = config.OUTPUT_STREAM_URL 
+        # Parent closes the WRITE ends of the pipes it gives to FFmpeg
+        # logger.debug(f"Parent closed WRITE ends of FFmpeg pipes: Video={video_pipe_w_fd}, Audio={audio_pipe_w_fd}")
+        ffmpeg_process = Process(
+            target=ffmpeg_worker,
+            args=(video_pipe_r_fd, audio_pipe_r_fd, output_stream_url, log_queue),
+            name="FFmpegProcess",
+            daemon=True # Make daemon so it doesn't block exit? Or manage explicitly.
+        )
+        ffmpeg_process.start()
+        processes.append(("FFmpeg", ffmpeg_process))
+        # time.sleep(0.1)
+        os.close(video_pipe_r_fd)
+        os.close(audio_pipe_r_fd)
+        video_pipe_r_fd = audio_pipe_r_fd = -1
+    except Exception as e:
+        logger.error(f"Failed to start FFmpeg process: {e}", exc_info=True)
+        # Close write ends if DHVG failed to start?
+        if video_pipe_r_fd is not None: os.close(video_pipe_r_fd)
+        if audio_pipe_r_fd is not None: os.close(audio_pipe_r_fd)    
+    
+    
 
     yield # Application runs here
 
     logger.info("Application shutdown: Stopping background processes...")
     # Send sentinel value (None) to signal processes to stop
+    
+    if broadcast_task and not broadcast_task.done():
+        logger.info("正在通知LLM回答广播器停止...")
+        try:
+            await asyncio.to_thread(llm_queue.put, None) 
+            broadcast_task.cancel()
+            try:
+                await asyncio.wait_for(broadcast_task, timeout=5.0)
+                logger.info("LLM回答广播任务已停止")
+            except asyncio.TimeoutError:
+                logger.warning("LLM回答广播任务未按时完成")
+            except asyncio.CancelledError:
+                 logger.info("LLM回答广播任务已被取消")
+        except Exception as e:
+            logger.error(f"停止LLM回答广播任务时出错: {e}", exc_info=True)
+    
     try:
          ask_queue.put(None)
          answer_queue.put(None)
@@ -120,6 +292,36 @@ async def lifespan(app: FastAPI):
 # Pass the lifespan manager to the FastAPI constructor
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/live/stream.m3u8")
+async def get_m3u8():
+    """
+    专门处理 HLS manifest 文件请求，强制设置禁止缓存的头。
+    """
+    m3u8_path = os.path.join(HLS_OUTPUT_DIR, "stream.m3u8")
+    logger.debug(f"Request for /live/stream.m3u8, checking path: {m3u8_path}") # 添加 Debug 日志
+
+    if not os.path.exists(m3u8_path):
+        logger.warning(f"m3u8 file not found at: {m3u8_path}")
+        return Response(status_code=404, content="Not Found")
+
+    try:
+        with open(m3u8_path, "rb") as f:
+            content = f.read()
+        
+        # ---> 关键：设置禁止缓存的响应头 <---
+        headers = {
+            'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+            'Pragma': 'no-cache', # 兼容旧版 HTTP/1.0
+            'Expires': '0', # 兼容旧版 HTTP/1.0
+            'Content-Type': 'application/vnd.apple.mpegurl' # 正确的 MIME 类型
+        }
+        logger.debug(f"Serving m3u8 file with no-cache headers. Size: {len(content)} bytes.")
+        return Response(content=content, headers=headers, status_code=200)
+    except Exception as e:
+        logger.error(f"Error reading or serving m3u8 file: {e}", exc_info=True)
+        return Response(status_code=500, content="Internal Server Error")
+    
+app.mount("/live", StaticFiles(directory=HLS_OUTPUT_DIR), name="hls")
 # --- Serve Frontend ---
 templates = Jinja2Templates(directory=config.TEMPLATES_DIR)
 
@@ -216,6 +418,31 @@ async def mic_endpoint(websocket: WebSocket):
         except RuntimeError: # Can happen if already closed
             pass
 
+@app.websocket("/llm_stream")
+async def llm_stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    client_host = websocket.client.host if websocket.client else "Unknown"
+    logger.info(f"LLM Stream WebSocket 连接已建立，来自: {client_host}") # LLM Stream WebSocket connection established from...
+    llm_stream_connections.add(websocket) # Add to the *LLM stream* specific set
+    logger.info(f"LLM Stream WebSocket {client_host} ADDED. 总计 LLM Stream 连接数: {len(llm_stream_connections)}") # LLM Stream WebSocket ADDED. Total LLM Stream connections...
+    try:
+        # Keep the connection open, wait for disconnect
+        while True:
+            # This endpoint is primarily for sending, but we need to await
+            # something to detect disconnects. Receiving text is standard.
+            # We don't actually process received data here.
+            data = await websocket.receive_text()
+            logger.debug(f"LLM Stream 端点收到消息 (通常忽略): {data}") # LLM Stream endpoint received message (usually ignored)
+
+    except WebSocketDisconnect:
+        logger.info(f"LLM Stream WebSocket 连接已断开，来自: {client_host}") # LLM Stream WebSocket connection disconnected from...
+    except Exception as e:
+        logger.error(f"LLM Stream WebSocket 端点出错: {e}", exc_info=True) # LLM Stream WebSocket endpoint error
+    finally:
+        if websocket in llm_stream_connections:
+            logger.info(f"正在从 LLM Stream 连接中移除 WebSocket {client_host}. 移除前总数: {len(llm_stream_connections)}") # Removing WebSocket from LLM Stream connections. Total before remove...
+            llm_stream_connections.remove(websocket)
+            logger.info(f"已从 LLM Stream 连接移除 WebSocket {client_host}. 当前总数: {len(llm_stream_connections)}") # Removed WebSocket from LLM Stream connections. Current total...
 
 # --- 文件上传识别路由 (Modified to put result on queue) ---
 @app.post("/upload_audio/", response_class=JSONResponse)
