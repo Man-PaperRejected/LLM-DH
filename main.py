@@ -3,6 +3,8 @@ import json
 import logging
 import logging.handlers
 import os
+import sys
+sys.path.append("/data/Code/AIGC/LLM-DH/dh/wav2lip")
 import fcntl
 import io
 import time # Import time for blocking sleep
@@ -20,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 import cv2
+
 # Assuming 'config.py' exists with necessary variables like:
 # VOSK_LOG_LEVEL, VOSK_MODEL_PATH, VOSK_SAMPLE_RATE, TEMPLATES_DIR,
 # CAMERA_INDEX, VIDEO_FPS, JPEG_QUALITY

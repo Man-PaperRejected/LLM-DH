@@ -1,1 +1,7 @@
+**/__pycache__
+llm/__pycache__
+*.pyc
+hls_stream/
 model/*
+
+.venv/

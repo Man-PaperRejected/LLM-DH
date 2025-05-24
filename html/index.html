@@ -169,7 +169,7 @@
 
         .message-assistant {
             background-color: #74c727; /* Light blue background */
-            color: #333;
+            color: #000000;
             border: 1px solid #74c727;
             align-self: flex-start; /* Align to the left */
             border-bottom-left-radius: 3px; /* Make it look like a speech bubble */
@@ -283,9 +283,9 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>  
 <script>
-    // JavaScript 部分保持不变，因为它通过 ID 选择元素，
-    // 并且布局的改变不影响其功能逻辑。
+
     const startButton = document.getElementById('startButton');
     const stopButton = document.getElementById('stopButton');
     const cleanButton = document.getElementById('cleanButton');
@@ -303,6 +303,7 @@
     let mediaStream;
     let isRecording = false;
     let partialTranscriptElement = null; // 用于跟踪当前的部分结果元素
+    let llmWebsocket;
 
     // --- WebSocket 地址 ---
     const wsUrl = `ws://${window.location.host}/mic`;
@@ -349,8 +350,9 @@
                 break;
             case 'llm_answer':
                 messageDiv.classList.add('message-assistant');
-                messageDiv.textContent = `assistant: ${text}`;
-                messageDiv.textContent = text;
+                messageDiv.innerHTML = marked.parse(text); 
+                //messageDiv.textContent = `assistant: ${text}`;
+                //messageDiv.textContent = text;
                 break;
             case 'final':
             default:
@@ -762,6 +764,7 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
+        connectLLMStream(); 
 
 
         const video = document.getElementById('dh-video');
