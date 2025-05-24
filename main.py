@@ -82,9 +82,17 @@ except Exception as e:
     exit(1)
 
 async def broadcast_llm_stream():
+    """监控LLM队列并向连接到/llm_stream的客户端广播消息。
+
+    该协程持续从`llm_queue`中获取LLM生成的文本片段，
+    并将其序列化为JSON格式，然后通过WebSocket连接发送给所有订阅的客户端。
+    它处理客户端断开连接，并允许通过在队列中发送`None`来优雅地停止。
+
+    Raises:
+        asyncio.CancelledError: 当任务被取消时引发。
+        Exception: 广播过程中发生任何其他意外错误时。
     """
-    Monitors llm_queue and broadcasts messages to clients connected to /llm_stream.
-    """
+    
     logger.info("LLM Stream广播任务已启动") # Broadcast task for LLM stream started
     while True:
         try:
@@ -140,7 +148,30 @@ broadcast_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manages the startup and shutdown of background processes."""
+    """管理FastAPI应用的生命周期，包括后台进程的启动和关闭。
+
+    在应用启动时：
+    1. 创建用于视频和音频数据传输的操作系统管道。
+    2. 启动LLM（大语言模型）、TTS（文本转语音）、Wav2Lip（数字人视频生成）
+       和FFmpeg（HLS流编码）等多个独立进程。
+    3. 启动一个异步任务以广播LLM的实时回复到WebSocket客户端。
+    4. 关闭父进程不再需要的管道端，确保子进程拥有正确的读写权限。
+
+    在应用关闭时：
+    1. 向队列发送停止信号，通知所有后台进程优雅地退出。
+    2. 逐一等待并终止未能优雅退出的进程。
+    3. 关闭所有队列资源。
+
+    Args:
+        app (FastAPI): FastAPI应用程序实例。
+
+    Yields:
+        None: 在所有启动操作完成后，将控制权交还给应用程序。
+
+    Raises:
+        RuntimeError: 如果管道创建失败。
+    """
+    
     logger.info("Application startup: Starting background processes...")
 
     # Pipes for DHVG -> FFmpeg communication
@@ -206,7 +237,7 @@ async def lifespan(app: FastAPI):
     except:
         logger.error("LLM Broadcast task Failed")
     
-    time.sleep(45)
+    # time.sleep(45)
     # Start ffmpeg Process
     try:
         logger.info(f"PARENT: Passing FDs to ffmpeg_worker: Video={video_pipe_r_fd}, Audio={audio_pipe_r_fd}")
@@ -296,6 +327,7 @@ app = FastAPI(lifespan=lifespan)
 async def get_m3u8():
     """
     专门处理 HLS manifest 文件请求，强制设置禁止缓存的头。
+    确保每次请求都能获取到最新的HLS切片列表
     """
     m3u8_path = os.path.join(HLS_OUTPUT_DIR, "stream.m3u8")
     logger.debug(f"Request for /live/stream.m3u8, checking path: {m3u8_path}") # 添加 Debug 日志
@@ -327,11 +359,34 @@ templates = Jinja2Templates(directory=config.TEMPLATES_DIR)
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index(request: Request):
+    """渲染并返回主页面的HTML模板。
+
+    Args:
+        request (Request): 客户端的HTTP请求对象，用于Jinja2模板上下文。
+
+    Returns:
+        fastapi.responses.TemplateResponse: 渲染后的HTML页面响应。
+    """
+    
     return templates.TemplateResponse("index.html", {"request": request})
 
 # --- WebSocket Endpoint for Transcription ---
 @app.websocket("/mic")
 async def mic_endpoint(websocket: WebSocket):
+    """处理来自客户端的实时麦克风音频WebSocket连接。
+
+    该端点接收客户端发送的原始音频字节流，使用Vosk语音识别模型
+    （在单独的线程中运行以避免阻塞）进行实时转录。
+    它将部分和最终的转录结果通过WebSocket发送回客户端，
+    并将最终的识别文本放入`ask_queue`供LLM进程处理。
+
+    Args:
+        websocket (WebSocket): 活跃的WebSocket连接对象。
+
+    Raises:
+        WebSocketDisconnect: 客户端断开连接时。
+        Exception: 在WebSocket通信或Vosk处理过程中发生任何其他意外错误时。
+    """
     await websocket.accept()
     client_host = websocket.client.host
     logger.info(f"WebSocket connection established from: {client_host}")
@@ -420,6 +475,20 @@ async def mic_endpoint(websocket: WebSocket):
 
 @app.websocket("/llm_stream")
 async def llm_stream_endpoint(websocket: WebSocket):
+    """处理用于接收LLM实时回复的WebSocket连接。
+
+    此端点主要用于将从`llm_queue`中获取的LLM回复广播给连接的客户端。
+    客户端连接后会被添加到`llm_stream_connections`集合中，
+    并保持开放状态以接收后续广播的消息。
+
+    Args:
+        websocket (WebSocket): 活跃的WebSocket连接对象。
+
+    Raises:
+        WebSocketDisconnect: 客户端断开连接时。
+        Exception: 在WebSocket端点操作过程中发生任何其他意外错误时。
+    """
+    
     await websocket.accept()
     client_host = websocket.client.host if websocket.client else "Unknown"
     logger.info(f"LLM Stream WebSocket 连接已建立，来自: {client_host}") # LLM Stream WebSocket connection established from...
@@ -535,7 +604,19 @@ async def handle_audio_upload(audio_file: UploadFile = File(...)):
 
 # --- Video Streaming Endpoint (Unchanged conceptually) ---
 async def gen_camera():
-    # Use camera index from config
+    """一个异步生成器，用于捕获摄像头视频流并将其编码为MJPEG格式。（已遗弃）
+
+    该函数从指定摄像头（配置中定义）捕获视频帧，
+    将其编码为JPEG图像，并以`multipart/x-mixed-replace`格式的字节流形式产出，
+    适合作为HTTP视频流响应。它会尝试维持配置中指定的帧率（FPS）。
+
+    Yields:
+        bytes: 格式化为MJPEG流部分的JPEG图像字节数据。
+
+    Raises:
+        asyncio.CancelledError: 当视频流任务被取消时。
+        Exception: 在摄像头操作或图像编码过程中发生任何其他意外错误时。
+    """
     cap = None # Initialize to None
     try:
         cap = cv2.VideoCapture(config.CAMERA_INDEX)
@@ -596,6 +677,14 @@ async def gen_camera():
 
 @app.get("/video_feed")
 async def video_feed():
+    """提供实时摄像头视频流的HTTP端点。（已遗弃）
+
+    该端点返回一个`StreamingResponse`，其内容由`gen_camera`生成器提供，
+    媒体类型设置为`multipart/x-mixed-replace`，适用于在浏览器中显示MJPEG流。
+
+    Returns:
+        fastapi.responses.StreamingResponse: 实时摄像头视频流的响应。
+    """
     logger.info(f"Request received for video stream /video_feed (Source: Camera {config.CAMERA_INDEX})")
     return StreamingResponse(gen_camera(), media_type='multipart/x-mixed-replace; boundary=frame')
 
@@ -603,6 +692,15 @@ async def video_feed():
 # --- Health Check Endpoint (Unchanged) ---
 @app.get("/health")
 async def health_check():
+    """提供应用程序的健康检查状态。
+
+    此端点返回一个JSON响应，指示应用程序是否正常运行，Vosk模型是否已加载，
+    以及所有后台多进程（LLM、TTS、Wav2Lip、FFmpeg）是否仍然存活。
+
+    Returns:
+        dict: 包含应用程序状态、Vosk模型加载状态和各个后台进程存活状态的字典。
+    """
+    
     # Basic check: app is running and model seems loaded
     model_status = "loaded" if 'model' in globals() and model is not None else "not loaded"
     # Check process health (simple check if they are alive)
