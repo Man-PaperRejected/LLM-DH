@@ -1,8 +1,8 @@
 import math
 from multiprocessing import Process, Queue as MpQueue # Use multiprocessing Queue and Process
 import threading
-import time
-import asyncio
+import audio
+import tempfile
 import io
 import numpy as np
 import os 
@@ -343,7 +343,7 @@ def wav2lip(tts_q: MpQueue,
     result_q = queue.Queue(maxsize=10)
     # frame_interval = 1.0 / fps # No longer needed for rate control
     # last_frame_time = time.monotonic() # No longer needed for rate control
-
+    temp_audio_files = []
     try:
         while running:
             # now = time.monotonic() # No longer needed for rate control
@@ -360,8 +360,21 @@ def wav2lip(tts_q: MpQueue,
                     running = False
                     continue
 
-                # Process audio and start thread (Keep your logic)
-                audio_np_array = np.frombuffer(audio_bytes, dtype=np.int16)
+
+                # audio_np_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                # 使用 tempfile创建一个临时 WAV 文件来保存 audio_bytes
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav_file:
+                    tmp_wav_path = tmp_wav_file.name
+                    with wave.open(tmp_wav_file, 'wb') as wf:
+                        wf.setnchannels(channels) 
+                        wf.setsampwidth(sampwidth) 
+                        wf.setframerate(framerate) 
+                        wf.writeframes(audio_bytes) 
+
+                temp_audio_files.append(tmp_wav_path) 
+                logger.info(f"Saved received audio to temporary WAV: {tmp_wav_path}")
+
+                audio_np_array = audio.load_wav(tmp_wav_path, framerate) 
                 mel_chunks = audio_processor.forward(audio_np_array)
                 frame_batch_copy, face_batch_copy, coord_batch_copy = copy.deepcopy(video_processor.frame_batch), copy.deepcopy(video_processor.face_batch), copy.deepcopy(video_processor.coords_batch)
 
@@ -461,6 +474,13 @@ def wav2lip(tts_q: MpQueue,
                     logger.debug(f"Closed {name} write pipe FD: {fd}")
                 except OSError as e:
                     logger.error(f"Error closing {name} write pipe FD {fd}: {e}")
+        for file_path in temp_audio_files:
+            try:
+                os.remove(file_path)
+                logger.info(f"Cleaned up temporary file: {file_path}")
+            except OSError as e:
+                logger.warning(f"Error cleaning up temporary file {file_path}: {e}")
+        temp_audio_files.clear() 
 
     logger.info(f"Wav2lip Looping Test Pipe process ({os.getpid()}) finished.")
         # try:
